@@ -292,36 +292,9 @@ async fn invite(cfg: &Config, minutes: i64) -> Result<()> {
     println!("Sign-in code: {code}");
     println!(
         "Valid for {minutes} minutes. Enter it at {}",
-        panel_url(cfg)
+        cfg.external_url(cfg.server.panel_host.as_deref().unwrap_or("localhost"))
     );
     Ok(())
-}
-
-/// Where to actually type the code. `public_url` when it is set; otherwise the
-/// panel hostname on the port openpages is listening on — which for a localhost
-/// install is a working link, and guessing `localhost:8788` was not.
-fn panel_url(cfg: &Config) -> String {
-    if let Some(url) = &cfg.server.public_url {
-        return url.clone();
-    }
-    let port = cfg
-        .server
-        .listen
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8788);
-    let host = cfg.server.panel_host.clone().unwrap_or_else(|| {
-        let l = &cfg.server.listen;
-        if l.starts_with("0.0.0.0") || l.starts_with("[::]") {
-            "localhost".into()
-        } else {
-            l.rsplit_once(':')
-                .map(|(h, _)| h.to_string())
-                .unwrap_or_else(|| "localhost".into())
-        }
-    });
-    format!("http://{host}:{port}")
 }
 
 async fn update_check(cfg: Config) -> Result<()> {

@@ -247,10 +247,34 @@ impl Config {
         format!("{}--{slug}.{}", short_sha(sha), self.server.base_domain)
     }
     pub fn site_url(&self, slug: &str) -> String {
-        format!("https://{}", self.site_host(slug))
+        self.external_url(&self.site_host(slug))
     }
     pub fn preview_url(&self, sha: &str, slug: &str) -> String {
-        format!("https://{}", self.preview_host(sha, slug))
+        self.external_url(&self.preview_host(sha, slug))
+    }
+
+    /// A link that actually opens.
+    ///
+    /// With a `public_url` there is a reverse proxy in front on the standard
+    /// ports, so `https://host` is right. Without one — a localhost trial, a
+    /// LAN install — openpages is answering on its own port over plain HTTP,
+    /// and printing `https://name.pages.localhost` gives every site in the
+    /// panel a link that cannot work.
+    pub fn external_url(&self, host: &str) -> String {
+        match self.server.public_url.as_deref() {
+            Some(u) if u.starts_with("http://") => format!("http://{host}"),
+            Some(_) => format!("https://{host}"),
+            None => format!("http://{host}:{}", self.listen_port()),
+        }
+    }
+
+    pub fn listen_port(&self) -> u16 {
+        self.server
+            .listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8788)
     }
 }
 
@@ -428,6 +452,35 @@ mod tests {
         let c: Config = toml::from_str("[server]\nbase_domain = \"pages.example.com\"\n").unwrap();
         assert_eq!(c.server.base_domain, "pages.example.com");
         assert_eq!(c.swap.policy, "quiet");
+    }
+
+    #[test]
+    fn site_links_open_on_a_localhost_install() {
+        let mut c = Config::default();
+        c.server.base_domain = "pages.localhost".into();
+        c.server.listen = "0.0.0.0:8788".into();
+        c.server.public_url = None;
+        assert_eq!(c.site_url("blog"), "http://blog.pages.localhost:8788");
+    }
+
+    #[test]
+    fn site_links_are_https_behind_a_proxy() {
+        let mut c = Config::default();
+        c.server.base_domain = "pages.example.com".into();
+        c.server.public_url = Some("https://openpages.example.com".into());
+        assert_eq!(c.site_url("blog"), "https://blog.pages.example.com");
+        assert_eq!(
+            c.preview_url("0123456789ab", "blog"),
+            "https://01234567--blog.pages.example.com"
+        );
+    }
+
+    #[test]
+    fn a_plain_http_public_url_is_taken_at_its_word() {
+        let mut c = Config::default();
+        c.server.base_domain = "pages.lan".into();
+        c.server.public_url = Some("http://openpages.lan".into());
+        assert_eq!(c.site_url("blog"), "http://blog.pages.lan");
     }
 
     #[test]

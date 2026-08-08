@@ -66,6 +66,14 @@ So: two failed starts, and the machine has fixed itself. This is
 `update::tests::the_guard_reverts_only_after_repeated_failures_to_start`, and
 it is tested precisely because it is the code that runs when nothing else does.
 
+**What this does not cover.** The guard runs as `<install_dir>/current update
+guard`, so it is the new binary checking on itself. A version that starts and
+then dies is reverted; a binary so broken it cannot be executed at all would
+take `ExecStartPre` down with it and never revert. That case is what
+verification is for — it runs the staged binary twice, once for `--version` and
+once for a full `selftest` boot — so a binary that cannot execute never reaches
+`current` in the first place.
+
 If the healer is enabled with `heal.heal_self = true`, a failed *build* of a new
 openpages version also opens a pull request against the openpages repository.
 That mode is always `pr`, never `direct` — nothing pushes straight to the tool
@@ -78,6 +86,12 @@ that runs everything.
 channel = "release"   # download the published binary, checksum verified
 # channel = "source"  # compile it here
 ```
+
+**Verification also checks the version is real.** A release tagged v1.2.3 whose
+asset was built before the version bump installs cleanly, restarts, still
+reports 1.2.2, sees 1.2.3 available, and loops for ever. openpages compares the
+staged binary's own `--version` against the tag and refuses a mismatch; the
+release workflow refuses to publish one in the first place.
 
 **`release`** is the default. The asset name is `openpages-<arch>-linux`, pinned
 in both the updater and the release workflow, and verified against the
