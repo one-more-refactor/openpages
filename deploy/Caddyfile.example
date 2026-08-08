@@ -1,0 +1,36 @@
+# openpages behind Caddy.
+#
+# openpages listens on one port and works out which site a request is for from
+# the Host header, so Caddy's whole job here is TLS and passing the header
+# through unchanged. Do not rewrite Host.
+
+# The panel.
+openpages.example.com {
+	reverse_proxy 127.0.0.1:8788
+}
+
+# Every published site, and every proof.
+#
+# A wildcard certificate needs a DNS challenge, which needs a Caddy build with
+# your DNS provider's module:
+#   xcaddy build --with github.com/caddy-dns/cloudflare
+*.pages.example.com {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:8788
+}
+
+# Without a wildcard certificate, on-demand TLS works too: Caddy asks openpages
+# whether a hostname is real before issuing for it, so nobody can make you mint
+# certificates for names you do not serve.
+#
+# {
+# 	on_demand_tls {
+# 		ask http://127.0.0.1:8788/healthz
+# 	}
+# }
+# https:// {
+# 	tls { on_demand }
+# 	reverse_proxy 127.0.0.1:8788
+# }

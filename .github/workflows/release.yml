@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile && bun run build
+        working-directory: web
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      # The asset name is what `openpages update` looks for. Changing it breaks
+      # every installed updater in the world, so it is pinned here on purpose.
+      - name: Package
+        run: |
+          cp target/${{ matrix.target }}/release/openpages openpages-${{ matrix.arch }}-linux
+          sha256sum openpages-${{ matrix.arch }}-linux > openpages-${{ matrix.arch }}-linux.sha256
+
+      - name: Prove it boots
+        run: ./openpages-${{ matrix.arch }}-linux selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openpages-${{ matrix.arch }}
+          path: |
+            openpages-${{ matrix.arch }}-linux
+            openpages-${{ matrix.arch }}-linux.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

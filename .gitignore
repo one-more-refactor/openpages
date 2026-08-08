@@ -1,0 +1,11 @@
+/target
+**/node_modules
+/web/dist
+/web/.svelte-kit
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store
+/data
+openpages.toml
