@@ -28,7 +28,12 @@ pub struct Args {
     pub public_url: Option<String>,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
-    /// Unix user the services run as.
+    /// `system` writes to /etc and /opt and runs as a dedicated account.
+    /// `user` installs entirely inside your home directory, as your own user,
+    /// needs no root, and is removed by deleting three directories.
+    #[arg(long, default_value = "system")]
+    pub scope: Scope,
+    /// Unix user the services run as. `--scope system` only.
     #[arg(long, default_value = "openpages")]
     pub user: String,
     /// For an agent-only install: the panel to dial.
@@ -39,6 +44,46 @@ pub struct Args {
     /// Print everything that would be written, write nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Scope {
+    System,
+    User,
+}
+
+impl Scope {
+    pub fn is_user(self) -> bool {
+        self == Scope::User
+    }
+
+    /// Where the config, the binaries and the data live. A user-scope install
+    /// follows the XDG layout so it lands where anything else in a home
+    /// directory would.
+    pub fn paths(self, home: &std::path::Path) -> Paths {
+        match self {
+            Scope::System => Paths {
+                config: PathBuf::from("/etc/openpages/config.toml"),
+                units: PathBuf::from("/etc/systemd/system"),
+                install: PathBuf::from("/opt/openpages/bin"),
+                data: PathBuf::from("/var/lib/openpages"),
+            },
+            Scope::User => Paths {
+                config: home.join(".config/openpages/config.toml"),
+                units: home.join(".config/systemd/user"),
+                install: home.join(".local/lib/openpages/bin"),
+                data: home.join(".local/share/openpages"),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub config: PathBuf,
+    pub units: PathBuf,
+    pub install: PathBuf,
+    pub data: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +111,15 @@ impl Components {
 
 pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
     println!("openpages {} — setup\n", crate::update::version());
+
+    let paths = args.scope.paths(&home()?);
+    cfg.server.data_dir = paths.data.clone();
+    cfg.update.install_dir = paths.install.clone();
+    cfg.update.systemctl_scope = if args.scope.is_user() {
+        "user".into()
+    } else {
+        "system".into()
+    };
 
     let components = match &args.components {
         Some(list) => Components::parse(list),
@@ -133,7 +187,7 @@ pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
     };
     cfg.build.runtime = runtime.clone();
 
-    let files = plan(&cfg, &components, &args)?;
+    let files = plan(&cfg, &components, &args, &paths)?;
 
     println!("\nThis machine will run:");
     for (name, why) in [
@@ -162,11 +216,19 @@ pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
         return Ok(());
     }
 
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("writing to /etc and /opt needs root — re-run with sudo, or use --dry-run to see the files");
+    if !args.scope.is_user() && unsafe { libc::geteuid() } != 0 {
+        bail!(
+            "writing to /etc and /opt needs root — re-run with sudo, use --scope user to \
+             install into your home directory instead, or --dry-run to see the files"
+        );
+    }
+    if args.scope.is_user() && unsafe { libc::geteuid() } == 0 {
+        bail!("--scope user installs into a home directory; do not run it as root");
     }
 
-    ensure_user(&args.user)?;
+    if !args.scope.is_user() {
+        ensure_user(&args.user)?;
+    }
     for (path, body) in &files {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -176,7 +238,9 @@ pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
     }
     std::fs::create_dir_all(&cfg.server.data_dir)?;
     std::fs::create_dir_all(&cfg.update.install_dir)?;
-    chown(&cfg.server.data_dir, &args.user)?;
+    if !args.scope.is_user() {
+        chown(&cfg.server.data_dir, &args.user)?;
+    }
 
     install_binary(&cfg)?;
 
@@ -186,51 +250,129 @@ pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
     } else {
         vec!["openpages-agent.service"]
     };
-    sh("systemctl", &["daemon-reload"])?;
+    let scope_flag: &[&str] = if args.scope.is_user() {
+        &["--user"]
+    } else {
+        &[]
+    };
+    sh("systemctl", &[scope_flag, &["daemon-reload"]].concat())?;
     for u in &units {
-        sh("systemctl", &["enable", "--now", u])?;
+        sh("systemctl", &[scope_flag, &["enable", "--now", u]].concat())?;
     }
+
+    let op = paths.install.join(crate::update::CURRENT);
+    let ctl = if args.scope.is_user() {
+        "systemctl --user"
+    } else {
+        "systemctl"
+    };
 
     println!("\nDone.\n");
     if components.panel {
-        println!("  1. Sign in to GitHub on this machine:  openpages login");
-        println!("  2. Get a code for the browser:         openpages invite");
         println!(
-            "  3. Point *.{} and {} at this host, then open the panel.",
-            cfg.server.base_domain,
-            cfg.server.panel_host.clone().unwrap_or_default()
+            "  1. Sign in to GitHub on this machine:  {} login",
+            op.display()
         );
-        println!("\n  Check everything: openpages doctor");
+        println!(
+            "  2. Get a code for the browser:         {} invite",
+            op.display()
+        );
+        if cfg.server.base_domain.ends_with("localhost") {
+            println!(
+                "  3. Open http://{} — *.localhost resolves to this machine on its own,\n     \
+                 so there is nothing to add to /etc/hosts.",
+                cfg.server.panel_host.clone().unwrap_or_default()
+            );
+        } else {
+            println!(
+                "  3. Point *.{} and {} at this host, then open the panel.",
+                cfg.server.base_domain,
+                cfg.server.panel_host.clone().unwrap_or_default()
+            );
+        }
+        println!("\n  Check everything:  {} doctor", op.display());
+        println!(
+            "  Logs:              journalctl {}-u openpages -f",
+            if args.scope.is_user() { "--user " } else { "" }
+        );
+        println!("  Stop it:           {ctl} disable --now openpages.socket openpages.service");
     } else {
         println!("  This node will appear in the panel under Nodes within a minute.");
+    }
+    if args.scope.is_user() {
+        println!(
+            "\n  Everything lives in {} , {} and {}.\n  \
+             Removing those three directories removes openpages completely.",
+            paths.config.parent().unwrap_or(&paths.config).display(),
+            paths.install.display(),
+            paths.data.display()
+        );
     }
     Ok(())
 }
 
 /// Everything that will be written, as (path, contents). Pure, so `--dry-run`
 /// shows exactly what a real run would do rather than an approximation of it.
-pub fn plan(cfg: &Config, c: &Components, args: &Args) -> Result<Vec<(PathBuf, String)>> {
+pub fn plan(
+    cfg: &Config,
+    c: &Components,
+    args: &Args,
+    paths: &Paths,
+) -> Result<Vec<(PathBuf, String)>> {
     let mut out = vec![(
-        PathBuf::from("/etc/openpages/config.toml"),
+        paths.config.clone(),
         toml::to_string_pretty(cfg).context("rendering the config")?,
     )];
 
     if c.panel {
+        out.push((paths.units.join("openpages.socket"), socket_unit(cfg)));
         out.push((
-            PathBuf::from("/etc/systemd/system/openpages.socket"),
-            socket_unit(cfg),
-        ));
-        out.push((
-            PathBuf::from("/etc/systemd/system/openpages.service"),
-            panel_unit(cfg, &args.user, c.agent),
+            paths.units.join("openpages.service"),
+            panel_unit(cfg, &args.user, c.agent, args.scope),
         ));
     } else if c.agent {
         out.push((
-            PathBuf::from("/etc/systemd/system/openpages-agent.service"),
-            agent_unit(cfg, &args.user),
+            paths.units.join("openpages-agent.service"),
+            agent_unit(cfg, &args.user, args.scope),
         ));
     }
     Ok(out)
+}
+
+/// A user-scope unit runs as you, so it must not claim an account it does not
+/// own, and must not lock down the very home directory it lives in.
+fn hardening(scope: Scope, user: &str, data: &str, install: &str) -> String {
+    if scope.is_user() {
+        format!(
+            "Environment=OPENPAGES_CONFIG=%h/.config/openpages/config.toml\n\
+             WorkingDirectory={data}\n\
+             NoNewPrivileges=yes\n\
+             PrivateTmp=yes\n\
+             LimitNOFILE=65536\n"
+        )
+    } else {
+        format!(
+            "User={user}\n\
+             Group={user}\n\
+             Environment=XDG_RUNTIME_DIR=/run/user/%U\n\
+             WorkingDirectory={data}\n\
+             StateDirectory=openpages\n\
+             NoNewPrivileges=yes\n\
+             ProtectSystem=full\n\
+             ProtectHome=read-only\n\
+             PrivateTmp=yes\n\
+             ReadWritePaths={data} {install}\n\
+             LimitNOFILE=65536\n"
+        )
+    }
+}
+
+fn wanted_by(scope: Scope) -> &'static str {
+    if scope.is_user() {
+        "default.target"
+    } else {
+        "multi-user.target"
+    }
 }
 
 fn socket_unit(cfg: &Config) -> String {
@@ -249,8 +391,10 @@ fn socket_unit(cfg: &Config) -> String {
     )
 }
 
-fn panel_unit(cfg: &Config, user: &str, with_agent: bool) -> String {
+fn panel_unit(cfg: &Config, user: &str, with_agent: bool, scope: Scope) -> String {
     let agent_flag = if with_agent { "" } else { " --no-agent" };
+    let install = cfg.update.install_dir.display().to_string();
+    let data = cfg.server.data_dir.display().to_string();
     format!(
         "[Unit]\n\
          Description=openpages\n\
@@ -258,53 +402,45 @@ fn panel_unit(cfg: &Config, user: &str, with_agent: bool) -> String {
          After=network-online.target openpages.socket\n\n\
          [Service]\n\
          Type=exec\n\
-         User={user}\n\
-         Group={user}\n\
          # Reverts a version that cannot start, before it gets a third chance.\n\
          ExecStartPre={install}/current update guard\n\
          ExecStart={install}/current serve{agent_flag}\n\
          Restart=always\n\
          RestartSec=2\n\
          Environment=OPENPAGES_LOG=openpages=info\n\
-         Environment=XDG_RUNTIME_DIR=/run/user/%U\n\
-         WorkingDirectory={data}\n\
-         StateDirectory=openpages\n\
-         NoNewPrivileges=yes\n\
-         ProtectSystem=full\n\
-         ProtectHome=read-only\n\
-         PrivateTmp=yes\n\
-         ReadWritePaths={data} {install}\n\
-         LimitNOFILE=65536\n\n\
+         {hardening}\n\
          [Install]\n\
-         WantedBy=multi-user.target\n",
-        install = cfg.update.install_dir.display(),
-        data = cfg.server.data_dir.display(),
+         WantedBy={wanted}\n",
+        hardening = hardening(scope, user, &data, &install),
+        wanted = wanted_by(scope),
     )
 }
 
-fn agent_unit(cfg: &Config, user: &str) -> String {
+fn agent_unit(cfg: &Config, user: &str, scope: Scope) -> String {
+    let install = cfg.update.install_dir.display().to_string();
+    let data = cfg.server.data_dir.display().to_string();
     format!(
         "[Unit]\n\
          Description=openpages build node\n\
          After=network-online.target\n\n\
          [Service]\n\
          Type=exec\n\
-         User={user}\n\
-         Group={user}\n\
          ExecStart={install}/current agent\n\
          Restart=always\n\
          RestartSec=5\n\
-         Environment=XDG_RUNTIME_DIR=/run/user/%U\n\
-         WorkingDirectory={data}\n\
-         NoNewPrivileges=yes\n\
-         ProtectSystem=full\n\
-         PrivateTmp=yes\n\
-         ReadWritePaths={data}\n\n\
+         {hardening}\n\
          [Install]\n\
-         WantedBy=multi-user.target\n",
-        install = cfg.update.install_dir.display(),
-        data = cfg.server.data_dir.display(),
+         WantedBy={wanted}\n",
+        hardening = hardening(scope, user, &data, &install),
+        wanted = wanted_by(scope),
     )
+}
+
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .context("HOME is not set — pass --scope system, or run as a real user")
 }
 
 fn install_binary(cfg: &Config) -> Result<()> {
@@ -448,6 +584,23 @@ fn strip_first_label(domain: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn args_for(scope: Scope) -> Args {
+        Args {
+            yes: true,
+            components: None,
+            base_domain: None,
+            panel_host: None,
+            public_url: None,
+            data_dir: None,
+            scope,
+            user: "openpages".into(),
+            panel_url: None,
+            node_token: None,
+            dry_run: true,
+        }
+    }
 
     #[test]
     fn components_parse_from_a_flag() {
@@ -474,19 +627,8 @@ mod tests {
             updater: false,
             healer: false,
         };
-        let args = Args {
-            yes: true,
-            components: None,
-            base_domain: None,
-            panel_host: None,
-            public_url: None,
-            data_dir: None,
-            user: "openpages".into(),
-            panel_url: None,
-            node_token: None,
-            dry_run: true,
-        };
-        let files = plan(&cfg, &c, &args).unwrap();
+        let args = args_for(Scope::System);
+        let files = plan(&cfg, &c, &args, &Scope::System.paths(Path::new("/home/x"))).unwrap();
         let names: Vec<String> = files.iter().map(|(p, _)| p.display().to_string()).collect();
         assert!(names.iter().any(|n| n.ends_with("openpages-agent.service")));
         assert!(!names.iter().any(|n| n.contains("openpages.socket")));
@@ -501,19 +643,8 @@ mod tests {
             updater: true,
             healer: false,
         };
-        let args = Args {
-            yes: true,
-            components: None,
-            base_domain: None,
-            panel_host: None,
-            public_url: None,
-            data_dir: None,
-            user: "openpages".into(),
-            panel_url: None,
-            node_token: None,
-            dry_run: true,
-        };
-        let files = plan(&cfg, &c, &args).unwrap();
+        let args = args_for(Scope::System);
+        let files = plan(&cfg, &c, &args, &Scope::System.paths(Path::new("/home/x"))).unwrap();
         let service = files
             .iter()
             .find(|(p, _)| p.display().to_string().ends_with("openpages.service"))
@@ -535,24 +666,77 @@ mod tests {
             updater: true,
             healer: false,
         };
-        let args = Args {
-            yes: true,
-            components: None,
-            base_domain: None,
-            panel_host: None,
-            public_url: None,
-            data_dir: None,
-            user: "openpages".into(),
-            panel_url: None,
-            node_token: None,
-            dry_run: true,
-        };
-        let files = plan(&cfg, &c, &args).unwrap();
+        let args = args_for(Scope::System);
+        let files = plan(&cfg, &c, &args, &Scope::System.paths(Path::new("/home/x"))).unwrap();
         let service = files
             .iter()
             .find(|(p, _)| p.display().to_string().ends_with("openpages.service"))
             .unwrap();
         assert!(service.1.contains("serve --no-agent"));
+    }
+
+    #[test]
+    fn a_user_scope_install_stays_inside_the_home_directory() {
+        let paths = Scope::User.paths(Path::new("/home/x"));
+        for p in [&paths.config, &paths.units, &paths.install, &paths.data] {
+            assert!(
+                p.starts_with("/home/x"),
+                "{} escaped the home directory",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_scope_unit_claims_no_account_and_does_not_lock_its_own_home() {
+        let mut cfg = Config::default();
+        cfg.update.install_dir = "/home/x/.local/lib/openpages/bin".into();
+        cfg.server.data_dir = "/home/x/.local/share/openpages".into();
+        let c = Components {
+            panel: true,
+            agent: true,
+            updater: true,
+            healer: false,
+        };
+        let paths = Scope::User.paths(Path::new("/home/x"));
+        let files = plan(&cfg, &c, &args_for(Scope::User), &paths).unwrap();
+        let unit = &files
+            .iter()
+            .find(|(p, _)| p.display().to_string().ends_with("openpages.service"))
+            .expect("a panel install writes openpages.service")
+            .1;
+
+        // Claiming User= as a non-root manager fails to start; ProtectHome
+        // would hide the data directory from the service that owns it.
+        assert!(!unit.contains("User="), "a user unit must not set User=");
+        assert!(!unit.contains("ProtectHome"));
+        assert!(!unit.contains("StateDirectory"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(
+            unit.contains("ExecStartPre"),
+            "the guard runs in every scope"
+        );
+    }
+
+    #[test]
+    fn a_system_scope_unit_still_runs_as_its_own_account() {
+        let cfg = Config::default();
+        let c = Components {
+            panel: true,
+            agent: true,
+            updater: true,
+            healer: false,
+        };
+        let paths = Scope::System.paths(Path::new("/home/x"));
+        let files = plan(&cfg, &c, &args_for(Scope::System), &paths).unwrap();
+        let unit = &files
+            .iter()
+            .find(|(p, _)| p.display().to_string().ends_with("openpages.service"))
+            .unwrap()
+            .1;
+        assert!(unit.contains("User=openpages"));
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 
     #[test]

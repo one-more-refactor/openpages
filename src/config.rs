@@ -101,6 +101,11 @@ pub struct Update {
     /// The systemd unit to restart after a swap.
     #[serde(default = "d_service")]
     pub service: String,
+    /// `system` or `user` — which systemd manager owns that unit. A rootless
+    /// install in a home directory cannot restart a system unit, and asking it
+    /// to would leave a verified update staged and never applied.
+    #[serde(default = "d_scope")]
+    pub systemctl_scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +346,9 @@ fn d_install_dir() -> PathBuf {
 }
 fn d_service() -> String {
     "openpages.service".into()
+}
+fn d_scope() -> String {
+    "system".into()
 }
 fn d_heal_mode() -> String {
     "pr".into()

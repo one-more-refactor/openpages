@@ -478,8 +478,14 @@ async fn relink(link: &Path, target: &Path) -> Result<()> {
 
 async fn restart(state: &Shared) -> Result<()> {
     let unit = &state.cfg.update.service;
+    let mut args: Vec<&str> = Vec::new();
+    if state.cfg.update.systemctl_scope == "user" {
+        args.push("--user");
+    }
+    args.extend(["--no-block", "restart", unit]);
+
     let ok = Command::new("systemctl")
-        .args(["--no-block", "restart", unit])
+        .args(&args)
         .status()
         .await
         .map(|s| s.success())

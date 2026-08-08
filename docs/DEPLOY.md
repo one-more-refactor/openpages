@@ -34,6 +34,22 @@ sudo openpages install --yes \
   --public-url https://openpages.example.com
 ```
 
+## Rootless, in your home directory
+
+For a laptop, a trial, or a machine where you would rather not touch `/etc`:
+
+```bash
+openpages install --scope user --yes --base-domain pages.localhost --public-url ''
+```
+
+Everything lands under `~/.config/openpages`, `~/.local/lib/openpages` and
+`~/.local/share/openpages`, the units are `systemctl --user` units, and no
+account is created. `*.localhost` resolves to your own machine without any DNS
+at all, so the panel is at `http://openpages.localhost:8788` straight away.
+
+Self-updates work the same way — the updater restarts the user unit rather
+than the system one. Uninstall by deleting those three directories.
+
 ## DNS
 
 Two records, both pointing at the host:

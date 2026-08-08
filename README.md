@@ -37,6 +37,17 @@ panel, paste the code, pick a repository. That is the whole setup.
 
 `openpages doctor` checks every piece and says which one is missing.
 
+### Or try it on your laptop first
+
+```bash
+openpages install --scope user --yes --base-domain pages.localhost --public-url ''
+```
+
+No root, no DNS, nothing outside your home directory: `*.localhost` already
+resolves to your own machine, so the panel is at
+**http://openpages.localhost:8788** and a site called `blog` is at
+`http://blog.pages.localhost:8788`. Removing three directories removes it.
+
 ## What it actually does
 
 **Deploys, without the parts you did not ask for**
