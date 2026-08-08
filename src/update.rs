@@ -160,7 +160,10 @@ async fn cycle(state: &Shared) -> Result<()> {
 
 /// The newest published version, if it is actually newer than this one.
 pub async fn check(state: &Shared) -> Result<Option<String>> {
-    let release = state.gh.latest_release(&state.cfg.update.repo).await?;
+    let Some(release) = state.gh.latest_release(&state.cfg.update.repo).await? else {
+        tracing::debug!("{} has published no releases", state.cfg.update.repo);
+        return Ok(None);
+    };
     if release.prerelease {
         return Ok(None);
     }
@@ -196,7 +199,11 @@ async fn stage(state: &Shared, target: &str) -> Result<PathBuf> {
 }
 
 async fn download(state: &Shared, target: &str, dest: &Path) -> Result<()> {
-    let release = state.gh.latest_release(&state.cfg.update.repo).await?;
+    let release = state
+        .gh
+        .latest_release(&state.cfg.update.repo)
+        .await?
+        .with_context(|| format!("{} has no releases", state.cfg.update.repo))?;
     let want = asset_name();
     let asset = release
         .assets

@@ -242,16 +242,33 @@ pub async fn deploy(
     branch: &str,
     kind: &str,
 ) -> Result<Deployment> {
-    // A queued or building deployment for the same commit is the same work.
-    let existing = db::deployments_for(&state.db, site.id, 20).await?;
-    if let Some(d) = existing.iter().find(|d| {
-        d.commit_sha == sha && matches!(d.state(), DeployState::Queued | DeployState::Building)
-    }) {
+    // Building the same commit twice produces the same bytes and swaps the site
+    // for no reason. A webhook and a poll racing over one push must not cost two
+    // deployments, so anything for this commit that has not failed *is* this
+    // work — whatever stage it has reached.
+    let existing = db::deployments_for(&state.db, site.id, 30).await?;
+    if let Some(d) = already_covered(&existing, sha, kind) {
+        tracing::debug!(site = %site.slug, "deployment {} already covers {}", d.id, crate::config::short_sha(sha));
         return Ok(d.clone());
     }
     let d = db::create_deployment(&state.db, site, sha, msg, branch, kind).await?;
     tracing::info!(site = %site.slug, "queued deployment {} for {}", d.id, crate::config::short_sha(sha));
     Ok(d)
+}
+
+/// The existing deployment that already accounts for this commit, if there is
+/// one. A failed build is worth retrying; anything else is not — the bytes
+/// would be identical and the site would swap for nothing.
+pub fn already_covered<'a>(
+    existing: &'a [Deployment],
+    sha: &str,
+    kind: &str,
+) -> Option<&'a Deployment> {
+    existing.iter().find(|d| {
+        d.commit_sha == sha
+            && d.kind == kind
+            && !matches!(d.state(), DeployState::Failed | DeployState::Cancelled)
+    })
 }
 
 /// For installs with no inbound route — the common self-hosted case. A webhook
@@ -291,13 +308,9 @@ async fn poll_once(state: &Shared) -> Result<()> {
             .execute(&state.db)
             .await?;
 
-        // The first poll records where the branch is without deploying it —
-        // adding a site should not immediately rebuild something already live.
-        if site.last_polled_sha.is_none()
-            && db::live_deployment(&state.db, site.id).await?.is_some()
-        {
-            continue;
-        }
+        // `deploy` will not duplicate a commit that is already accounted for,
+        // so a site added a second ago — whose first deployment is still
+        // building — is not built twice.
         deploy(
             state,
             &site,
@@ -313,6 +326,67 @@ async fn poll_once(state: &Shared) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn dep(id: i64, sha: &str, kind: &str, state: &str) -> Deployment {
+        Deployment {
+            id,
+            site_id: 1,
+            commit_sha: sha.into(),
+            commit_msg: None,
+            branch: "main".into(),
+            kind: kind.into(),
+            state: state.into(),
+            node_id: None,
+            artifact_path: None,
+            container_id: None,
+            container_port: None,
+            error_summary: None,
+            claimed_at: None,
+            started_at: None,
+            ready_at: None,
+            promoted_at: None,
+            finished_at: None,
+            retired_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_commit_already_being_built_is_not_queued_again() {
+        // A webhook and a poll can both see one push. They must cost one build.
+        let existing = vec![dep(1, "abc", "production", "building")];
+        assert_eq!(
+            already_covered(&existing, "abc", "production").unwrap().id,
+            1
+        );
+    }
+
+    #[test]
+    fn a_commit_that_is_already_live_is_not_rebuilt() {
+        let existing = vec![dep(1, "abc", "production", "live")];
+        assert!(already_covered(&existing, "abc", "production").is_some());
+    }
+
+    #[test]
+    fn a_failed_commit_can_be_retried() {
+        let existing = vec![dep(1, "abc", "production", "failed")];
+        assert!(already_covered(&existing, "abc", "production").is_none());
+    }
+
+    #[test]
+    fn a_proof_and_a_production_build_of_one_commit_are_different_work() {
+        let existing = vec![dep(1, "abc", "preview", "live")];
+        assert!(already_covered(&existing, "abc", "production").is_none());
+        assert!(already_covered(&existing, "abc", "preview").is_some());
+    }
+
+    #[test]
+    fn a_different_commit_is_always_new_work() {
+        let existing = vec![dep(1, "abc", "production", "live")];
+        assert!(already_covered(&existing, "def", "production").is_none());
+    }
+
     #[test]
     fn build_env_follows_the_configured_data_dir() {
         let mut cfg = crate::config::Config::default();

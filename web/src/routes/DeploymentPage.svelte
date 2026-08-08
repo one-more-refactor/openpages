@@ -27,15 +27,32 @@
   })
 
   /* The log arrives over server-sent events. It is a one-way stream that
-     reconnects by itself; a WebSocket would be a second protocol for no gain. */
+     reconnects by itself; a WebSocket would be a second protocol for no gain.
+
+     Two guards against the same line arriving twice: the server resumes from
+     Last-Event-ID, and anything at or below the highest sequence already held
+     is dropped. Belt and braces, because a duplicated build log is the kind of
+     bug people spend an hour disbelieving. */
+  let seen = -1
+
   $effect(() => {
     const es = new EventSource(`/api/deployments/${id}/stream?after=-1`)
+
     es.addEventListener('log', (ev) => {
       const l = JSON.parse(ev.data)
+      if (l.seq <= seen) return
+      seen = l.seq
       lines = [...lines, l].slice(-4000)
       if (follow && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight))
     })
-    es.addEventListener('state', () => refresh())
+
+    es.addEventListener('state', (ev) => {
+      refresh()
+      // Once it has settled there is nothing more to stream. Closing here stops
+      // the browser reopening the connection every few seconds forever.
+      if (JSON.parse(ev.data).settled) es.close()
+    })
+
     es.onerror = () => {}
     return () => es.close()
   })

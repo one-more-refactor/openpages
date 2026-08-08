@@ -293,8 +293,12 @@ async fn update_check(cfg: Config) -> Result<()> {
     let db = db::open(&cfg.db_path()).await?;
     let state = state::AppState::new(cfg, rt, db).await?;
     match update::check(&state).await? {
-        Some(v) => println!("{} is available (running {})", v, update::version()),
-        None => println!("{} is the latest version", update::version()),
+        Some(v) => println!("{v} is available (running {})", update::version()),
+        None => println!(
+            "{} is the newest version {} offers",
+            update::version(),
+            state.cfg.update.repo
+        ),
     }
     Ok(())
 }
@@ -380,6 +384,11 @@ async fn doctor(cfg: Config) -> Result<()> {
     fn line(ok: bool, what: &str, detail: &str) {
         println!("{} {what:<22} {detail}", if ok { "ok  " } else { "FAIL" });
     }
+    // A working choice that happens not to be the fast one is not a failure.
+    // `doctor` is only useful if FAIL always means something is actually broken.
+    fn note(what: &str, detail: &str) {
+        println!("note {what:<22} {detail}");
+    }
 
     let gh = gh::Gh::new(cfg.github.gh_bin.clone());
     let has_gh = gh.installed().await;
@@ -449,13 +458,13 @@ async fn doctor(cfg: Config) -> Result<()> {
         line(true, "self-healing", "off");
     }
 
-    line(
-        cfg.server.public_url.is_some(),
-        "public url",
-        &cfg.server.public_url.clone().unwrap_or_else(|| {
-            "not set — openpages will poll GitHub instead of using webhooks".into()
-        }),
-    );
+    match cfg.server.public_url.clone() {
+        Some(url) => line(true, "public url", &url),
+        None => note(
+            "public url",
+            "not set — GitHub is polled instead of pushing. Works everywhere, just slower.",
+        ),
+    }
     println!("\nsites will be served at *.{}", cfg.server.base_domain);
     Ok(())
 }

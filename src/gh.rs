@@ -93,6 +93,22 @@ impl Gh {
         serde_json::from_str(&raw).with_context(|| format!("parsing response of `gh api {path}`"))
     }
 
+    /// Same, but "GitHub has no such thing" is an answer rather than a failure.
+    /// A repository with no releases yet is the normal state of a new project,
+    /// and reporting it as an error makes `openpages update check` look broken
+    /// on the day it is most likely to be run.
+    async fn api_opt<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<Option<T>> {
+        match self.run(&["api", path]).await {
+            Ok(raw) => {
+                Ok(Some(serde_json::from_str(&raw).with_context(|| {
+                    format!("parsing response of `gh api {path}`")
+                })?))
+            }
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn installed(&self) -> bool {
         Command::new(&self.bin)
             .arg("--version")
@@ -276,7 +292,8 @@ impl Gh {
             .ok_or_else(|| anyhow!("gh pr create printed no URL"))
     }
 
-    pub async fn latest_release(&self, repo: &str) -> Result<Release> {
+    /// `None` means the repository exists but has published nothing yet.
+    pub async fn latest_release(&self, repo: &str) -> Result<Option<Release>> {
         #[derive(Deserialize)]
         struct R {
             tag_name: String,
@@ -284,13 +301,20 @@ impl Gh {
             #[serde(default)]
             prerelease: bool,
         }
-        let r: R = self.api(&format!("repos/{repo}/releases/latest")).await?;
-        Ok(Release {
-            tag: r.tag_name,
-            prerelease: r.prerelease,
-            assets: r.assets,
-        })
+        Ok(self
+            .api_opt::<R>(&format!("repos/{repo}/releases/latest"))
+            .await?
+            .map(|r| Release {
+                tag: r.tag_name,
+                prerelease: r.prerelease,
+                assets: r.assets,
+            }))
     }
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    text.contains("HTTP 404") || text.contains("Not Found")
 }
 
 #[derive(Debug, Clone)]

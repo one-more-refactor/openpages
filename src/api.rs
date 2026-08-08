@@ -689,13 +689,24 @@ async fn get_full_log(State(state): State<Shared>, Path(id): Path<i64>) -> ApiRe
 
 /// Server-sent events, because a build log is one-way and SSE reconnects by
 /// itself. A WebSocket here would be a second protocol for no benefit.
+///
+/// Every event carries its sequence number as the SSE id, and a reconnect is
+/// resumed from `Last-Event-ID`. Without that, the browser's own automatic
+/// reconnect replays the whole log from the beginning — which it will do,
+/// because the stream deliberately ends once a deployment settles.
 async fn stream_logs(
     State(state): State<Shared>,
     Path(id): Path<i64>,
     Query(q): Query<After>,
+    headers: HeaderMap,
 ) -> Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+
     let stream = async_stream::stream! {
-        let mut seq = q.after;
+        let mut seq = resume.unwrap_or(q.after);
         let mut idle = 0u32;
         loop {
             match db::logs_since(&state.db, id, seq).await {
@@ -703,7 +714,7 @@ async fn stream_logs(
                     idle = 0;
                     for l in lines {
                         seq = l.seq;
-                        if let Ok(ev) = Event::default().event("log").json_data(&l) {
+                        if let Ok(ev) = Event::default().id(l.seq.to_string()).event("log").json_data(&l) {
                             yield Ok(ev);
                         }
                     }
@@ -711,13 +722,14 @@ async fn stream_logs(
                 _ => idle += 1,
             }
             if let Ok(Some(d)) = db::deployment(&state.db, id).await {
+                let settled = d.state().is_terminal()
+                    || matches!(d.state(), DeployState::Ready | DeployState::Live);
                 if let Ok(ev) = Event::default().event("state").json_data(json!({
-                    "state": d.state, "label": d.state().label(), "error": d.error_summary,
+                    "state": d.state, "label": d.state().label(),
+                    "error": d.error_summary, "settled": settled,
                 })) {
                     yield Ok(ev);
                 }
-                let settled = d.state().is_terminal()
-                    || matches!(d.state(), DeployState::Ready | DeployState::Live);
                 if settled && idle > 1 { break; }
             }
             if idle > 900 { break; }
