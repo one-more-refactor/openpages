@@ -249,6 +249,7 @@ async fn version(State(state): State<Shared>) -> Json<serde_json::Value> {
     Json(json!({
         "version": update::version(),
         "runtime": state.rt.name(),
+        "runtime_error": state.runtime_error,
         "base_domain": state.cfg.server.base_domain,
         "uptime_secs": state.started.elapsed().as_secs(),
     }))
@@ -299,6 +300,7 @@ async fn overview(State(state): State<Shared>) -> ApiResult<Json<serde_json::Val
         "pending_update": state.pending_update.lock().unwrap().clone(),
         "base_domain": state.cfg.server.base_domain,
         "heal_enabled": state.cfg.heal.enabled,
+        "runtime_error": state.runtime_error,
     })))
 }
 
@@ -797,6 +799,7 @@ async fn system(State(state): State<Shared>) -> ApiResult<Json<serde_json::Value
     Ok(Json(json!({
         "version": update::version(),
         "runtime": state.rt.name(),
+        "runtime_error": state.runtime_error,
         "uptime_secs": state.started.elapsed().as_secs(),
         "load_per_core": crate::util::load_per_core(),
         "channel": state.cfg.update.channel,

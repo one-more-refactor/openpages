@@ -69,9 +69,10 @@
       <span class="micro">Load per core</span>
       <span class="mono">{sys.load_per_core.toFixed(2)}</span>
     </div>
-    <div class="row" style="grid-template-columns: 240px 1fr; cursor:default">
+    <div class="row" style="grid-template-columns: 240px 1fr; cursor:default"
+         class:row--dead={sys.runtime_error}>
       <span class="micro">Runtime</span>
-      <span class="mono">{sys.runtime}</span>
+      <span class="mono">{sys.runtime_error ? sys.runtime_error : sys.runtime}</span>
     </div>
     <div class="row" style="grid-template-columns: 240px 1fr; cursor:default">
       <span class="micro">Self-healing</span>

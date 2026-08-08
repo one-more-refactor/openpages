@@ -157,10 +157,26 @@ repoint DNS. Webhook URLs follow `public_url`; if that changes, remove and
 re-add each site so the hooks are rewritten, or turn webhooks off and let it
 poll.
 
+## Things that cost time here, so they need not cost yours
+
+- **`PrivateTmp=yes` breaks rootless Podman.** Podman keeps per-user state under
+  the real `/tmp`, so a private one makes `podman info` fail — with an error
+  that never mentions `/tmp`. The generated units set it only on a machine that
+  does not build.
+- **openpages starts even with no container runtime.** It says so loudly in the
+  log, on the overview, and under Press, and every build fails with the reason.
+  A panel that crash-loops is a panel you cannot open to find out why.
+- **A `--scope user` install is found by the CLI automatically.** Config
+  resolution is `--config`, `$OPENPAGES_CONFIG`, `./openpages.toml`,
+  `~/.config/openpages/config.toml`, `/etc/openpages/config.toml`. Without that
+  fourth entry the service works while `openpages invite` reaches for
+  `/var/lib` and fails naming the wrong file.
+
 ## When something is wrong
 
 ```bash
 openpages doctor              # every dependency, one line each
+systemctl --user status openpages   # or without --user for a system install
 journalctl -u openpages -f
 curl -s localhost:8788/healthz
 curl -sI -H 'Host: name.pages.example.com' localhost:8788/ | grep x-openpages

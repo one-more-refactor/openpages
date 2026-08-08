@@ -45,7 +45,16 @@ pub async fn run(cfg: Config) -> Result<()> {
         .context("no node token — pass --token, or mint one in the panel under Nodes")?;
 
     cfg.ensure_dirs()?;
-    let rt = Runtime::detect(&cfg.build.runtime).await?;
+    // Same reasoning as the panel: a node that exits cannot report why. One
+    // that stays up appears in the panel and fails each job with the real error.
+    let rt = match Runtime::detect(&cfg.build.runtime).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!("no usable container runtime: {e:#}");
+            tracing::error!("this node will accept work and fail it with that message");
+            Runtime::Podman
+        }
+    };
     let edge_listen = cfg.node.edge_listen.clone();
 
     let agent = Agent {

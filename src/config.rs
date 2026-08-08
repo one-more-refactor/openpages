@@ -169,6 +169,12 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("OPENPAGES_CONFIG").map(PathBuf::from))
             .or_else(|| some_if_file("openpages.toml"))
+            // A rootless `--scope user` install lives here. Without this the
+            // service would work (its unit sets OPENPAGES_CONFIG) while every
+            // CLI command silently fell through to the system config and its
+            // /var/lib data directory — which is unwritable, so `openpages
+            // invite` would fail for a reason that names the wrong file.
+            .or_else(|| some_if_file(user_config_path()))
             .or_else(|| some_if_file("/etc/openpages/config.toml"));
 
         let mut cfg: Config = match &path {
@@ -252,9 +258,18 @@ pub fn short_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
-fn some_if_file(p: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(p);
+fn some_if_file(p: impl Into<PathBuf>) -> Option<PathBuf> {
+    let p = p.into();
     p.is_file().then_some(p)
+}
+
+/// `$XDG_CONFIG_HOME/openpages/config.toml`, falling back to `~/.config`.
+pub fn user_config_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
+        .join("openpages/config.toml")
 }
 
 impl Default for Server {
@@ -413,6 +428,16 @@ mod tests {
         let c: Config = toml::from_str("[server]\nbase_domain = \"pages.example.com\"\n").unwrap();
         assert_eq!(c.server.base_domain, "pages.example.com");
         assert_eq!(c.swap.policy, "quiet");
+    }
+
+    #[test]
+    fn the_user_config_path_follows_xdg() {
+        let path = user_config_path();
+        assert!(path.ends_with("openpages/config.toml"));
+        assert!(
+            path.is_absolute(),
+            "a relative config path would resolve against the working directory"
+        );
     }
 
     #[test]

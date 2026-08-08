@@ -147,12 +147,25 @@ fn init_tracing() {
 
 async fn serve(cfg: Config, with_agent: bool) -> Result<()> {
     cfg.ensure_dirs()?;
-    let rt = Runtime::detect(&cfg.build.runtime).await?;
+    // A missing or broken container runtime must not stop the panel from
+    // starting. Nothing can be built without one, but a crash-looping service
+    // is a service you cannot open to find out why — and `podman info` fails
+    // for reasons (a sandboxed /tmp, a stopped daemon) that the panel is the
+    // right place to report.
+    let (rt, runtime_error) = match Runtime::detect(&cfg.build.runtime).await {
+        Ok(rt) => (rt, None),
+        Err(e) => {
+            let why = format!("{e:#}");
+            tracing::error!("no usable container runtime: {why}");
+            tracing::error!("openpages is starting anyway; builds will fail until this is fixed");
+            (Runtime::Podman, Some(why))
+        }
+    };
     let db = db::open(&cfg.db_path()).await?;
     db::ensure_local_node(&db, rt.name()).await?;
 
     let listen = cfg.server.listen.clone();
-    let state = state::AppState::new(cfg, rt, db).await?;
+    let state = state::AppState::new(cfg, rt, runtime_error, db).await?;
 
     if db::user_count(&state.db).await? == 0 {
         let code = api::mint_claim_code(&state.db, 60).await?;
@@ -276,14 +289,39 @@ async fn login(cfg: &Config) -> Result<()> {
 async fn invite(cfg: &Config, minutes: i64) -> Result<()> {
     let db = db::open(&cfg.db_path()).await?;
     let code = api::mint_claim_code(&db, minutes).await?;
-    let url = cfg
-        .server
-        .public_url
-        .clone()
-        .unwrap_or_else(|| "http://localhost:8788".into());
     println!("Sign-in code: {code}");
-    println!("Valid for {minutes} minutes. Enter it at {url}");
+    println!(
+        "Valid for {minutes} minutes. Enter it at {}",
+        panel_url(cfg)
+    );
     Ok(())
+}
+
+/// Where to actually type the code. `public_url` when it is set; otherwise the
+/// panel hostname on the port openpages is listening on — which for a localhost
+/// install is a working link, and guessing `localhost:8788` was not.
+fn panel_url(cfg: &Config) -> String {
+    if let Some(url) = &cfg.server.public_url {
+        return url.clone();
+    }
+    let port = cfg
+        .server
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8788);
+    let host = cfg.server.panel_host.clone().unwrap_or_else(|| {
+        let l = &cfg.server.listen;
+        if l.starts_with("0.0.0.0") || l.starts_with("[::]") {
+            "localhost".into()
+        } else {
+            l.rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| "localhost".into())
+        }
+    });
+    format!("http://{host}:{port}")
 }
 
 async fn update_check(cfg: Config) -> Result<()> {
@@ -291,7 +329,7 @@ async fn update_check(cfg: Config) -> Result<()> {
         .await
         .unwrap_or(Runtime::Podman);
     let db = db::open(&cfg.db_path()).await?;
-    let state = state::AppState::new(cfg, rt, db).await?;
+    let state = state::AppState::new(cfg, rt, None, db).await?;
     match update::check(&state).await? {
         Some(v) => println!("{v} is available (running {})", update::version()),
         None => println!(
@@ -335,7 +373,7 @@ async fn selftest(mut cfg: Config, data_dir: Option<PathBuf>) -> Result<()> {
         .await
         .context("selftest: migrations")?;
     db::ensure_local_node(&db, rt.name()).await?;
-    let state = state::AppState::new(cfg, rt, db).await?;
+    let state = state::AppState::new(cfg, rt, None, db).await?;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();

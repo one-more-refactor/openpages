@@ -21,6 +21,9 @@ pub struct AppState {
     pub traffic: TrafficMeter,
     pub routes: RwLock<HashMap<String, CachedRoute>>,
     pub webhook_secret: String,
+    /// Why the container runtime is unusable, if it is. openpages still starts:
+    /// a panel that crash-loops is a panel you cannot open to find out why.
+    pub runtime_error: Option<String>,
     pub started: Instant,
     /// Set once a new version has been staged and verified, so the panel can
     /// say so and the swap scheduler knows a restart is pending.
@@ -34,7 +37,12 @@ pub struct CachedRoute {
 }
 
 impl AppState {
-    pub async fn new(cfg: Config, rt: Runtime, db: Db) -> Result<Shared> {
+    pub async fn new(
+        cfg: Config,
+        rt: Runtime,
+        runtime_error: Option<String>,
+        db: Db,
+    ) -> Result<Shared> {
         let secret = match crate::db::setting(&db, "webhook_secret").await? {
             Some(s) => s,
             None => {
@@ -52,6 +60,7 @@ impl AppState {
             traffic: TrafficMeter::default(),
             routes: RwLock::new(HashMap::new()),
             webhook_secret: secret,
+            runtime_error,
             started: Instant::now(),
             pending_update: Mutex::new(None),
         }))

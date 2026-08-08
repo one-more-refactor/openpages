@@ -64,6 +64,17 @@
   <div class="pied"><span class="micro">Trouble</span><div class="mt-sm">{error}</div></div>
 {/if}
 
+{#if data?.runtime_error}
+  <div class="pied">
+    <span class="micro">No container runtime — nothing can be built</span>
+    <pre>{data.runtime_error}</pre>
+    <p class="hint" style="margin-bottom:0">
+      Everything already published keeps serving. Fix the runtime and restart
+      openpages; <span class="mono">openpages doctor</span> checks it.
+    </p>
+  </div>
+{/if}
+
 <div class="ledger">
   {#each data?.sites ?? [] as s (s.id)}
     <button class="row" class:row--live={s.state === 'live'} class:row--dead={s.state === 'failed'}

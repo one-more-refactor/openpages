@@ -341,13 +341,19 @@ pub fn plan(
 
 /// A user-scope unit runs as you, so it must not claim an account it does not
 /// own, and must not lock down the very home directory it lives in.
-fn hardening(scope: Scope, user: &str, data: &str, install: &str) -> String {
+///
+/// `PrivateTmp` is conditional and that is not a detail. Rootless Podman keeps
+/// per-user state under the real `/tmp`, so a private one makes `podman info`
+/// fail — with an error that says nothing about `/tmp`. A machine that builds
+/// gets the shared `/tmp`; a panel that only routes keeps the private one.
+fn hardening(scope: Scope, user: &str, data: &str, install: &str, builds: bool) -> String {
+    let private_tmp = if builds { "" } else { "PrivateTmp=yes\n" };
     if scope.is_user() {
         format!(
             "Environment=OPENPAGES_CONFIG=%h/.config/openpages/config.toml\n\
              WorkingDirectory={data}\n\
              NoNewPrivileges=yes\n\
-             PrivateTmp=yes\n\
+             {private_tmp}\
              LimitNOFILE=65536\n"
         )
     } else {
@@ -360,7 +366,7 @@ fn hardening(scope: Scope, user: &str, data: &str, install: &str) -> String {
              NoNewPrivileges=yes\n\
              ProtectSystem=full\n\
              ProtectHome=read-only\n\
-             PrivateTmp=yes\n\
+             {private_tmp}\
              ReadWritePaths={data} {install}\n\
              LimitNOFILE=65536\n"
         )
@@ -411,7 +417,7 @@ fn panel_unit(cfg: &Config, user: &str, with_agent: bool, scope: Scope) -> Strin
          {hardening}\n\
          [Install]\n\
          WantedBy={wanted}\n",
-        hardening = hardening(scope, user, &data, &install),
+        hardening = hardening(scope, user, &data, &install, with_agent),
         wanted = wanted_by(scope),
     )
 }
@@ -431,7 +437,7 @@ fn agent_unit(cfg: &Config, user: &str, scope: Scope) -> String {
          {hardening}\n\
          [Install]\n\
          WantedBy={wanted}\n",
-        hardening = hardening(scope, user, &data, &install),
+        hardening = hardening(scope, user, &data, &install, true),
         wanted = wanted_by(scope),
     )
 }
