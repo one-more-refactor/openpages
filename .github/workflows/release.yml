@@ -8,7 +8,26 @@ permissions:
   contents: write
 
 jobs:
+  # A tag that does not match Cargo.toml publishes binaries that disagree with
+  # the release they are in. Installed copies then update, restart, still report
+  # the old version, see the update again, and loop for ever. Catch it here,
+  # before anything is published.
+  tag-matches-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag must be the crate version
+        run: |
+          crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tag=${GITHUB_REF_NAME#v}
+          echo "Cargo.toml: $crate   tag: $tag"
+          test "$crate" = "$tag" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          }
+
   build:
+    needs: tag-matches-version
     strategy:
       matrix:
         include:
@@ -36,8 +55,14 @@ jobs:
           cp target/${{ matrix.target }}/release/openpages openpages-${{ matrix.arch }}-linux
           sha256sum openpages-${{ matrix.arch }}-linux > openpages-${{ matrix.arch }}-linux.sha256
 
-      - name: Prove it boots
-        run: ./openpages-${{ matrix.arch }}-linux selftest
+      - name: Prove it boots, and is the version on the tin
+        run: |
+          ./openpages-${{ matrix.arch }}-linux selftest
+          reported=$(./openpages-${{ matrix.arch }}-linux --version | awk '{print $NF}')
+          test "$reported" = "${GITHUB_REF_NAME#v}" || {
+            echo "::error::binary reports $reported, release is ${GITHUB_REF_NAME#v}"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:

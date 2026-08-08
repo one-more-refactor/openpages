@@ -113,7 +113,7 @@ async fn cycle(state: &Shared) -> Result<()> {
         None,
     )
     .await?;
-    if let Err(e) = verify(&staged).await {
+    if let Err(e) = verify(&staged, &newer).await {
         let detail = format!("{e:#}");
         db::record_update(
             &state.db,
@@ -360,7 +360,13 @@ async fn run(dir: &Path, bin: &str, args: &[&str], timeout: u64) -> Result<Strin
 
 /// Boot the staged binary against a throwaway database on a throwaway port and
 /// make it answer. This is the check that "compiles" is not the same as "works".
-pub async fn verify(binary: &Path) -> Result<()> {
+///
+/// It also insists the binary *is* the version the release claimed. A release
+/// tagged v1.2.3 whose asset was built from 1.2.2 will otherwise install
+/// cleanly, restart, still report the old version, see the update again, and
+/// loop for ever — reinstalling itself every check interval until something
+/// else breaks. Trusting the tag is the bug; this is the check.
+pub async fn verify(binary: &Path, expected: &str) -> Result<()> {
     let out = Command::new(binary)
         .arg("--version")
         .stdin(Stdio::null())
@@ -369,6 +375,15 @@ pub async fn verify(binary: &Path) -> Result<()> {
         .context("the staged binary will not run at all")?;
     if !out.status.success() {
         bail!("`--version` exited {}", out.status.code().unwrap_or(-1));
+    }
+
+    let reported = parse_version(&String::from_utf8_lossy(&out.stdout))
+        .context("could not read a version out of `--version`")?;
+    if reported != expected {
+        bail!(
+            "the release is tagged {expected} but the binary in it reports {reported} — \
+             refusing to install it, because it would update to itself for ever"
+        );
     }
 
     let scratch = tempfile::tempdir()?;
@@ -422,16 +437,24 @@ pub async fn apply(state: &Shared, staged: &Path, new_version: &str) -> Result<(
     let installed = install_dir(state).join(format!("openpages-{new_version}"));
     if installed != staged {
         tokio::fs::create_dir_all(install_dir(state)).await.ok();
-        tokio::fs::copy(staged, &installed)
+        // Copy beside it, then rename over. Writing directly to a path some
+        // process is executing fails with ETXTBSY; a rename only unlinks the
+        // old inode, which the running process keeps hold of until it exits.
+        let tmp = installed.with_extension("incoming");
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tokio::fs::copy(staged, &tmp)
             .await
             .context("installing the staged binary")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut p = tokio::fs::metadata(&installed).await?.permissions();
+            let mut p = tokio::fs::metadata(&tmp).await?.permissions();
             p.set_mode(0o755);
-            tokio::fs::set_permissions(&installed, p).await?;
+            tokio::fs::set_permissions(&tmp, p).await?;
         }
+        tokio::fs::rename(&tmp, &installed)
+            .await
+            .context("putting the new binary in place")?;
     }
     let _ = bin_dir;
 
@@ -585,6 +608,14 @@ async fn write_marker(state: &Shared, p: &Pending) -> Result<()> {
     Ok(())
 }
 
+/// `openpages 1.2.3` → `1.2.3`.
+pub fn parse_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find_map(|t| semver::Version::parse(t.trim_start_matches('v')).ok())
+        .map(|v| v.to_string())
+}
+
 fn install_dir(state: &Shared) -> PathBuf {
     state.cfg.update.install_dir.clone()
 }
@@ -596,6 +627,39 @@ fn current_exe() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_is_read_out_of_the_binarys_own_output() {
+        assert_eq!(parse_version("openpages 0.1.2\n").as_deref(), Some("0.1.2"));
+        assert_eq!(
+            parse_version("openpages v1.10.0").as_deref(),
+            Some("1.10.0")
+        );
+        assert_eq!(parse_version("no version here").as_deref(), None);
+        assert_eq!(parse_version("").as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn a_binary_that_is_not_the_version_it_claims_is_refused() {
+        // The exact shape of a release tagged v0.1.2 whose asset was built
+        // before the version bump: it installs, restarts, still reports the old
+        // version, and updates to itself for ever.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("openpages-0.1.2");
+        std::fs::write(&fake, "#!/bin/sh\necho 'openpages 0.1.1'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = verify(&fake, "0.1.2").await.unwrap_err().to_string();
+        assert!(err.contains("reports 0.1.1"), "got: {err}");
+        assert!(
+            err.contains("for ever"),
+            "the reason must be in the message: {err}"
+        );
+    }
 
     #[test]
     fn the_asset_name_names_this_architecture() {
