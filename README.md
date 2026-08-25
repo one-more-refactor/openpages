@@ -17,8 +17,39 @@ certificate for your own domain.
 &nbsp;![Runtime](https://img.shields.io/badge/runtime-rootless%20Podman%20%7C%20Docker-17140f?style=flat-square&logo=podman&logoColor=white)
 &nbsp;![Binary](https://img.shields.io/badge/ships%20as-one%20binary-17140f?style=flat-square)
 &nbsp;![Swap](https://img.shields.io/badge/swaps-when%20nobody's%20looking-c4321c?style=flat-square)
+&nbsp;![Status](https://img.shields.io/badge/status-alpha-c4321c?style=flat-square)
 
 </div>
+
+---
+
+> ## ⚠️ Alpha — work in progress
+>
+> openpages is early software under active development. It is public so it can be
+> read and picked apart, not because it is finished. **Every release is an alpha
+> pre-release**, and there is no stable version.
+>
+> What that means in practice:
+>
+> - **Breaking changes land without a migration path.** The SQLite schema, the
+>   panel API and the agent protocol are all still moving; assume an upgrade can
+>   mean wiping `data_dir` and re-linking your sites.
+> - **It has only ever run on its author's machines.** The install path, the
+>   webhook path and the swap scheduler have been exercised on a handful of real
+>   deploys — not across the framework matrix the README lists, and not for long
+>   enough to trust the traffic profile it learns.
+> - **The self-updater replaces the binary that is serving your sites.** It
+>   verifies by real boot and reverts itself, and that guard is tested — but it
+>   is the piece with the most to lose. Read [`docs/UPDATES.md`](docs/UPDATES.md)
+>   before enabling it on something you care about.
+> - **Self-healing is off by default and stays that way** until you have read
+>   [`docs/HEALING.md`](docs/HEALING.md). It opens pull requests against your
+>   repository.
+> - **Nobody has audited this but its author.** A build runs your repository's
+>   code on your machine, and build environment variables sit in plain text in
+>   SQLite — see the honesty notes below.
+>
+> Run it on a host you can rebuild, and keep the sites that matter somewhere else.
 
 ---
 
