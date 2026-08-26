@@ -23,16 +23,17 @@ certificate for your own domain.
 
 ---
 
-> ## ⚠️ Alpha — work in progress
+> ## ⚠️ Alpha — finished, not polished
 >
-> openpages is early software under active development. It is public so it can be
-> read and picked apart, not because it is finished. **Every release is an alpha
-> pre-release**, and there is no stable version.
+> openpages does what this page says — the deploys, swaps, self-updates and
+> rollbacks below have all run on real machines. But it is a personal project,
+> published as-is: **every release is an alpha**, there is no roadmap, and
+> maintenance is best-effort.
 >
 > What that means in practice:
 >
-> - **Breaking changes land without a migration path.** The SQLite schema, the
->   panel API and the agent protocol are all still moving; assume an upgrade can
+> - **Any future change may break without a migration path.** The SQLite schema,
+>   the panel API and the agent protocol are not frozen; assume an upgrade can
 >   mean wiping `data_dir` and re-linking your sites.
 > - **It has only ever run on its author's machines.** The install path, the
 >   webhook path and the swap scheduler have been exercised on a handful of real
