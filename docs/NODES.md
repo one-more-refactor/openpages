@@ -43,8 +43,12 @@ x-openpages-target: static:blog/412
 x-openpages-target: container:38211
 ```
 
-The node has no database, so it is told rather than asked to look up. A request
-to a node's edge without that header is refused — it is not a general proxy.
+The node has no database, so it is told rather than asked to look up. Each
+request also carries `x-openpages-node-key`, the SHA-256 of the node's secret
+that the panel stored at enrolment; the node recomputes it from its own token.
+A request without both headers is refused — it is not a general proxy. The
+panel never forwards a visitor's own copies of these headers. Panel and node
+must be upgraded together: a node with this check refuses an older panel.
 
 Give `--edge-url` an address the panel can reach: a LAN address, a tailnet
 address, a private VPC address. If the node is genuinely unreachable, keep its

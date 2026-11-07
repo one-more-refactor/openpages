@@ -33,11 +33,16 @@ pub enum Target {
     Remote {
         base: String,
         spec: String,
+        /// The node's stored token hash, sent so the node can tell the panel
+        /// from anyone else who can reach its edge port.
+        key: Option<String>,
     },
 }
 
 /// The contract between the panel's edge and a node's edge.
 pub const TARGET_HEADER: &str = "x-openpages-target";
+/// SHA-256 of the node's secret. The node recomputes it from its own token.
+pub const NODE_KEY_HEADER: &str = "x-openpages-node-key";
 
 #[derive(Clone, Debug)]
 pub struct Route {
@@ -137,7 +142,11 @@ async fn resolve_uncached(state: &Shared, host: &str) -> Option<Route> {
                 return Some(Route {
                     site_id: site.id,
                     deployment_id: deployment.id,
-                    target: Target::Remote { base, spec },
+                    target: Target::Remote {
+                        base,
+                        spec,
+                        key: node.token_hash.clone(),
+                    },
                 });
             }
         }
@@ -174,8 +183,10 @@ pub async fn handle(State(state): State<Shared>, req: Request) -> Response {
 
     let mut response = match route.target.clone() {
         Target::Static { dir, rules } => serve_static(&dir, &rules, req).await,
-        Target::Container { port } => proxy(&format!("http://127.0.0.1:{port}"), req, None).await,
-        Target::Remote { base, spec } => proxy(&base, req, Some(&spec)).await,
+        Target::Container { port } => {
+            proxy(&format!("http://127.0.0.1:{port}"), req, None, None).await
+        }
+        Target::Remote { base, spec, key } => proxy(&base, req, Some(&spec), key.as_deref()).await,
     };
 
     // Which deployment answered. The difference between "the swap did not
@@ -229,8 +240,7 @@ pub async fn serve_static(dir: &Path, rules: &Rules, req: Request) -> Response {
         None => {}
     }
 
-    let custom = dir.join("404.html");
-    if custom.is_file() {
+    if let Some((custom, _)) = pick_file(dir, "404.html").await {
         return send_file(&custom, 404, &path, rules, req.headers()).await;
     }
     (
@@ -244,6 +254,16 @@ pub async fn serve_static(dir: &Path, rules: &Rules, req: Request) -> Response {
 /// `/`, `/about`, `/about/` and `/about.html` should all find the same page —
 /// static site generators disagree about which one they emit.
 async fn pick_file(dir: &Path, rel: &str) -> Option<(PathBuf, u16)> {
+    let (file, status) = pick_file_unchecked(dir, rel).await?;
+    // A symlink in the build output must not reach outside the deployment:
+    // `ln -s /etc dist/x`, from the repo or from any install script, would
+    // otherwise publish the host's filesystem.
+    let root = tokio::fs::canonicalize(dir).await.ok()?;
+    let real = tokio::fs::canonicalize(&file).await.ok()?;
+    real.starts_with(&root).then_some((real, status))
+}
+
+async fn pick_file_unchecked(dir: &Path, rel: &str) -> Option<(PathBuf, u16)> {
     let base = dir.join(rel);
     if base.is_file() {
         return Some((base, 200));
@@ -532,7 +552,12 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
+pub async fn proxy(
+    base: &str,
+    req: Request,
+    spec: Option<&str>,
+    node_key: Option<&str>,
+) -> Response {
     let (parts, body) = req.into_parts();
     let path_q = parts
         .uri
@@ -552,6 +577,13 @@ pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
         if HOP_BY_HOP.contains(&name.as_str()) || name == "host" {
             continue;
         }
+        // Never forward a visitor's own routing headers. reqwest appends rather
+        // than replaces, and the node reads the first value, so a visitor
+        // sending `x-openpages-target: container:6379` used to choose which
+        // local port on the node the request went to.
+        if name == TARGET_HEADER || name == NODE_KEY_HEADER {
+            continue;
+        }
         out = out.header(k, v);
     }
     out = out.header("x-forwarded-proto", "https");
@@ -560,6 +592,9 @@ pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
     }
     if let Some(spec) = spec {
         out = out.header(TARGET_HEADER, spec);
+    }
+    if let Some(key) = node_key {
+        out = out.header(NODE_KEY_HEADER, key);
     }
 
     let resp = match out.body(bytes).send().await {
@@ -600,6 +635,80 @@ pub fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn get(path: &str) -> Request {
+        axum::http::Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn symlinks_out_of_the_deployment_are_not_served() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "host file").unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(site.path().join("index.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(site.path().join("a.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            site.path().join("leak.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink(site.path().join("a.txt"), site.path().join("alias.txt"))
+            .unwrap();
+        let rules = Rules::default();
+
+        let ok = serve_static(site.path(), &rules, get("/index.html")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        // A symlink that stays inside the deployment is fine.
+        let alias = serve_static(site.path(), &rules, get("/alias.txt")).await;
+        assert_eq!(alias.status(), StatusCode::OK);
+        for p in ["/leak.txt", "/dir/secret.txt"] {
+            let r = serve_static(site.path(), &rules, get(p)).await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_visitor_cannot_choose_the_node_target() {
+        // A stand-in node edge that reports every target and key it was sent.
+        async fn echo(req: Request) -> String {
+            let all = |n: &str| {
+                req.headers()
+                    .get_all(n)
+                    .iter()
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!("{}|{}", all(TARGET_HEADER), all(NODE_KEY_HEADER))
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, axum::Router::new().fallback(echo))
+                .await
+                .unwrap();
+        });
+
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .header(TARGET_HEADER, "container:6379")
+            .header(NODE_KEY_HEADER, "forged")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(
+            &format!("http://{addr}"),
+            req,
+            Some("static:blog/1"),
+            Some("k"),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "static:blog/1|k");
+    }
 
     #[test]
     fn the_panel_host_beats_a_site_with_the_same_name() {

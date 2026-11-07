@@ -342,6 +342,24 @@ pub fn clone_url(repo: &str, token: Option<&str>) -> String {
     }
 }
 
+/// Environment that hands git the token as an HTTP header for github.com only,
+/// without putting it in argv or in any file.
+pub fn auth_env(token: &str) -> Vec<(String, String)> {
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    vec![
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        (
+            "GIT_CONFIG_KEY_0".into(),
+            "http.https://github.com/.extraheader".into(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".into(),
+            format!("AUTHORIZATION: basic {basic}"),
+        ),
+    ]
+}
+
 pub fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
@@ -354,6 +372,17 @@ mod tests {
     fn clone_url_embeds_the_token_only_when_there_is_one() {
         assert_eq!(clone_url("a/b", None), "https://github.com/a/b.git");
         assert!(clone_url("a/b", Some("ghs_x")).contains("x-access-token:ghs_x@"));
+    }
+
+    #[test]
+    fn auth_env_carries_the_token_as_a_github_scoped_header() {
+        let env = auth_env("ghs_x");
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_KEY_0" && v == "http.https://github.com/.extraheader"));
+        // base64("x-access-token:ghs_x")
+        assert!(env.iter().any(|(k, v)| k == "GIT_CONFIG_VALUE_0"
+            && v == "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hzX3g="));
     }
 
     #[test]

@@ -34,7 +34,13 @@ pub struct BuildEnv {
 pub type LogSink = mpsc::Sender<(String, String)>;
 
 pub async fn run(job: &BuildJob, env: &BuildEnv, sink: LogSink) -> BuildOutcome {
-    let secrets: Vec<String> = job.clone_token.iter().cloned().collect();
+    let mut secrets: Vec<String> = job.clone_token.iter().cloned().collect();
+    // The header form of the token, in case git ever echoes it.
+    if let Some(t) = &job.clone_token {
+        use base64::Engine;
+        secrets
+            .push(base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{t}")));
+    }
     let recorder = Recorder::new(sink, secrets.clone());
 
     match run_inner(job, env, &recorder).await {
@@ -106,10 +112,18 @@ async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<Bui
 /// Fetch exactly one commit. Not the branch tip: between the webhook firing and
 /// the build starting, the branch can move, and a deployment labelled `abc1234`
 /// that actually contains `def5678` is a debugging session nobody deserves.
+///
+/// The token never touches the disk. It used to be part of the remote URL,
+/// which git writes into `.git/config` — inside the workspace that is then
+/// bind-mounted into the build container, where every install script could
+/// read it. It now travels as an `http.extraheader` in the environment of the
+/// git processes that need it, scoped to github.com.
 async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
-    let url = gh::clone_url(&job.repo, job.clone_token.as_deref());
-    git(work, &["init", "--quiet"], rec).await?;
-    git(work, &["remote", "add", "origin", &url], rec).await?;
+    let url = gh::clone_url(&job.repo, None);
+    let auth = job.clone_token.as_deref().map(gh::auth_env);
+    let auth = auth.as_deref();
+    git(work, &["init", "--quiet"], None, rec).await?;
+    git(work, &["remote", "add", "origin", &url], None, rec).await?;
     git(
         work,
         &[
@@ -120,6 +134,7 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
             "origin",
             &job.commit_sha,
         ],
+        auth,
         rec,
     )
     .await
@@ -133,6 +148,7 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
     git(
         work,
         &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        None,
         rec,
     )
     .await?;
@@ -150,6 +166,7 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
                 "1",
                 "--recursive",
             ],
+            auth,
             rec,
         )
         .await?;
@@ -157,13 +174,22 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
     Ok(())
 }
 
-async fn git(dir: &Path, args: &[&str], rec: &Recorder) -> Result<()> {
-    let out = Command::new("git")
-        .args(args)
+async fn git(
+    dir: &Path,
+    args: &[&str],
+    auth: Option<&[(String, String)]>,
+    rec: &Recorder,
+) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    for (k, v) in auth.unwrap_or_default() {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .await
         .context("running git — is it installed on this node?")?;
@@ -248,6 +274,11 @@ async fn static_build(
         })?;
 
     let out_dir = src.join(rel.trim_matches('/'));
+    contained(
+        &env.work_dir.join(format!("d{}", job.deployment_id)),
+        &out_dir,
+        &rel,
+    )?;
     verify_static(&out_dir, &rel, env.max_artifact_mb)?;
 
     let dest = env
@@ -276,6 +307,26 @@ async fn static_build(
         error_summary: None,
         incident: None,
     })
+}
+
+/// The output directory must be a real directory inside this build's workspace.
+/// The repository and every install script control what is in there, so a
+/// symlinked `dist` (or root directory) would otherwise make `place` move or
+/// publish a directory from anywhere on the host.
+fn contained(work: &Path, out_dir: &Path, rel: &str) -> Result<()> {
+    if std::fs::symlink_metadata(out_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!("output directory `{rel}` is a symlink; it must be a real directory");
+    }
+    let (Ok(work), Ok(out)) = (std::fs::canonicalize(work), std::fs::canonicalize(out_dir)) else {
+        return Ok(()); // does not exist: verify_static says so
+    };
+    if !out.starts_with(&work) {
+        bail!("output directory `{rel}` resolves outside the build workspace");
+    }
+    Ok(())
 }
 
 /// The checks that catch the mistake everybody makes: a build that "succeeded"
@@ -584,6 +635,25 @@ mod tests {
             std::fs::write(p, b).unwrap();
         }
         d
+    }
+
+    #[test]
+    fn a_symlinked_or_escaping_output_directory_is_refused() {
+        let outside = dir_with(&[("index.html", "<h1>host</h1>")]);
+        let work = dir_with(&[("real/index.html", "<h1>ok</h1>")]);
+        std::os::unix::fs::symlink(outside.path(), work.path().join("dist")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), work.path().join("root")).unwrap();
+
+        assert!(contained(work.path(), &work.path().join("real"), "real").is_ok());
+        let err = contained(work.path(), &work.path().join("dist"), "dist")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        // A symlinked root directory with a real-looking output under it.
+        let err = contained(work.path(), &work.path().join("root/."), "root/.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside"), "{err}");
     }
 
     #[test]

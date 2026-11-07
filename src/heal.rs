@@ -224,8 +224,11 @@ async fn run(state: &Shared, t: &Trigger, mode: &'static str, heal_id: i64) -> R
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await?;
 
+    // The token goes to git through the environment, never into the remote
+    // URL: `.git/config` is readable by the agent working in this checkout.
     let token = state.gh.token().await.ok();
-    let url = gh::clone_url(&t.repo, token.as_deref());
+    let auth = token.as_deref().map(gh::auth_env).unwrap_or_default();
+    let url = gh::clone_url(&t.repo, None);
 
     // Shallow but not depth-1: a fix often needs to see what recently changed,
     // and `git log` on a single commit tells you nothing.
@@ -233,22 +236,22 @@ async fn run(state: &Shared, t: &Trigger, mode: &'static str, heal_id: i64) -> R
         &dir,
         "git",
         &["clone", "--depth", "30", "--branch", &t.branch, &url, "."],
-        None,
+        &auth,
     )
     .await
     .context("cloning the repository to work in")?;
 
     if let Some(sha) = &t.commit_sha {
-        let _ = sh(&dir, "git", &["checkout", "--quiet", sha], None).await;
+        let _ = sh(&dir, "git", &["checkout", "--quiet", sha], &[]).await;
     }
 
-    let before = sh(&dir, "git", &["rev-parse", "HEAD"], None)
+    let before = sh(&dir, "git", &["rev-parse", "HEAD"], &[])
         .await?
         .trim()
         .to_string();
     let note = ask_claude(state, &dir, &t.incident).await?;
 
-    let dirty = sh(&dir, "git", &["status", "--porcelain"], None).await?;
+    let dirty = sh(&dir, "git", &["status", "--porcelain"], &[]).await?;
     if dirty.trim().is_empty() {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         return Ok(Outcome::NoFix { note });
@@ -261,8 +264,8 @@ async fn run(state: &Shared, t: &Trigger, mode: &'static str, heal_id: i64) -> R
         crate::incident::first_sentence(&t.incident.summary)
     );
 
-    sh(&dir, "git", &["checkout", "-b", &branch], None).await?;
-    sh(&dir, "git", &["add", "-A"], None).await?;
+    sh(&dir, "git", &["checkout", "-b", &branch], &[]).await?;
+    sh(&dir, "git", &["add", "-A"], &[]).await?;
     sh(
         &dir,
         "git",
@@ -275,7 +278,7 @@ async fn run(state: &Shared, t: &Trigger, mode: &'static str, heal_id: i64) -> R
             "-m",
             &format!("{title}\n\n{note}"),
         ],
-        None,
+        &[],
     )
     .await?;
 
@@ -289,7 +292,7 @@ async fn run(state: &Shared, t: &Trigger, mode: &'static str, heal_id: i64) -> R
         &dir,
         "git",
         &["push", "--force-with-lease", "origin", &refspec],
-        None,
+        &auth,
     )
     .await
     .context("pushing the fix")?;
@@ -401,7 +404,7 @@ pub fn parse_reply(stdout: &str) -> String {
         .to_string()
 }
 
-async fn sh(dir: &PathBuf, bin: &str, args: &[&str], env: Option<(&str, &str)>) -> Result<String> {
+async fn sh(dir: &PathBuf, bin: &str, args: &[&str], env: &[(String, String)]) -> Result<String> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(dir)
@@ -409,7 +412,7 @@ async fn sh(dir: &PathBuf, bin: &str, args: &[&str], env: Option<(&str, &str)>) 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some((k, v)) = env {
+    for (k, v) in env {
         cmd.env(k, v);
     }
     let out = cmd
