@@ -242,6 +242,23 @@ impl Agent {
 
 // ── the node's edge ─────────────────────────────────────────────────────────
 
+fn not_from_panel() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "this is an openpages node edge; it only answers requests proxied by a panel\n",
+    )
+        .into_response()
+}
+
+/// The panel stores `sha256(secret)` for a token `<id>.<secret>` and sends it
+/// with every proxied request.
+fn key_matches(token: &str, presented: &str) -> bool {
+    let Some((_, secret)) = token.split_once('.') else {
+        return false;
+    };
+    !presented.is_empty() && crate::util::secret_eq(&crate::util::sha256_hex(secret), presented)
+}
+
 async fn serve_edge(agent: Agent, listen: &str) -> Result<()> {
     let app = Router::new()
         .fallback(get(serve).post(serve).put(serve).patch(serve).delete(serve))
@@ -259,16 +276,22 @@ async fn serve(State(agent): State<Agent>, req: Request) -> Response {
         req.headers(),
         axum::http::HeaderName::from_static(edge::TARGET_HEADER),
     ) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "this is an openpages node edge; it only answers requests proxied by a panel\n",
-        )
-            .into_response();
+        return not_from_panel();
     };
+    // Only the panel knows the hash of this node's secret. Without the check,
+    // anyone who could reach this port picked any local port to proxy to.
+    let presented = edge::header_str(
+        req.headers(),
+        axum::http::HeaderName::from_static(edge::NODE_KEY_HEADER),
+    )
+    .unwrap_or_default();
+    if !key_matches(&agent.token, &presented) {
+        return not_from_panel();
+    }
 
     match spec.split_once(':') {
         Some(("container", port)) => match port.parse::<u16>() {
-            Ok(p) => edge::proxy(&format!("http://127.0.0.1:{p}"), req, None).await,
+            Ok(p) => edge::proxy(&format!("http://127.0.0.1:{p}"), req, None, None).await,
             Err(_) => (StatusCode::BAD_REQUEST, "bad container target").into_response(),
         },
         Some(("static", rel)) => {
@@ -284,5 +307,20 @@ async fn serve(State(agent): State<Agent>, req: Request) -> Response {
             edge::serve_static(&dir, &rules, req).await
         }
         _ => (StatusCode::BAD_REQUEST, "unrecognised target").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_hash_of_our_own_secret_opens_the_edge() {
+        let token = "n_ab12cd.s3cret";
+        let key = crate::util::sha256_hex("s3cret");
+        assert!(key_matches(token, &key));
+        assert!(!key_matches(token, ""));
+        assert!(!key_matches(token, &crate::util::sha256_hex("other")));
+        assert!(!key_matches("no-dot", &key));
     }
 }

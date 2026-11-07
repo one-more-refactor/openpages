@@ -872,7 +872,12 @@ async fn webhook(
 
     let push: PushEvent =
         serde_json::from_str(&body).map_err(|e| bad(format!("unreadable push event: {e}")))?;
-    let branch = push.git_ref.rsplit('/').next().unwrap_or("").to_string();
+    // Only branch pushes deploy. `rsplit('/')` used to turn `refs/heads/fix/main`
+    // into `main` (a production deploy of a feature branch) and tags into
+    // branches.
+    let Some(branch) = push.git_ref.strip_prefix("refs/heads/").map(str::to_string) else {
+        return Ok(Json(json!({ "ok": true, "ignored": push.git_ref })));
+    };
     let mut started = Vec::new();
 
     for site in db::site_by_repo(&state.db, &push.repository.full_name).await? {
@@ -1004,7 +1009,11 @@ async fn node_logs(
     headers: HeaderMap,
     Json(b): Json<NodeLogs>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    node_auth(&state, &headers).await?;
+    let node = node_auth(&state, &headers).await?;
+    let d = db::deployment(&state.db, b.deployment_id)
+        .await?
+        .ok_or_else(|| missing("deployment"))?;
+    claimed_by(&d, &node)?;
     db::append_logs(&state.db, b.deployment_id, &b.lines).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -1014,10 +1023,17 @@ async fn node_result(
     headers: HeaderMap,
     Json(out): Json<crate::models::BuildOutcome>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    node_auth(&state, &headers).await?;
+    let node = node_auth(&state, &headers).await?;
     let d = db::deployment(&state.db, out.deployment_id)
         .await?
         .ok_or_else(|| missing("deployment"))?;
+    claimed_by(&d, &node)?;
+    if d.state != "building" {
+        return Err(Fail(
+            StatusCode::CONFLICT,
+            "that deployment is not building".into(),
+        ));
+    }
     let site = db::site(&state.db, d.site_id)
         .await?
         .ok_or_else(|| missing("site"))?;
@@ -1049,6 +1065,16 @@ async fn node_result(
         });
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// A node may only report on a deployment that was queued for it. Without
+/// this, any node token could mark a local deployment ready with an
+/// `artifact_path` of `/`, or a `container_port` of any port on the panel.
+fn claimed_by(d: &crate::models::Deployment, node: &crate::models::Node) -> ApiResult<()> {
+    if d.node_id.as_deref().unwrap_or("local") != node.id {
+        return Err(missing("deployment"));
+    }
+    Ok(())
 }
 
 // ── the panel itself ────────────────────────────────────────────────────────
