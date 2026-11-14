@@ -53,9 +53,13 @@ certificate for your own domain.
 > - **Self-healing is off by default and stays that way** until you have read
 >   [`docs/HEALING.md`](docs/HEALING.md). It opens pull requests against your
 >   repository.
-> - **Nobody has audited this but its author.** A build runs your repository's
->   code on your machine, and build environment variables sit in plain text in
->   SQLite — see the honesty notes below.
+> - **One security review so far (2026-11-14).** Its two critical findings —
+>   a build could publish symlinks that served host files, and could read the
+>   GitHub token from `.git/config` — are fixed in 0.1.5; update before anything
+>   else. Still true: a build runs your repository's code on your machine,
+>   preview builds of *any* branch get the site's full environment, secrets
+>   included, and a remote node holds your `gh` token. Do not link repositories
+>   whose contributors or dependencies you do not trust.
 >
 > Run it on a host you can rebuild, and keep the sites that matter somewhere else.
 
