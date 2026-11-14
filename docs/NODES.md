@@ -43,8 +43,19 @@ x-openpages-target: static:blog/412
 x-openpages-target: container:38211
 ```
 
-The node has no database, so it is told rather than asked to look up. A request
-to a node's edge without that header is refused — it is not a general proxy.
+The node has no database, so it is told rather than asked to look up. The
+panel signs that header — an HMAC over the target and the current time, keyed
+with this node's token hash, sent as `x-openpages-signature` — and the node
+refuses any target that is unsigned, signed with another key, or more than five
+minutes old. Keep the node's clock in sync (NTP). The panel also drops any
+`x-openpages-*` header a visitor sends before proxying. Before 0.1.5 neither was
+true, and a node's edge would proxy to any of its own loopback ports for anyone
+who could reach it, directly or through the panel.
+
+A node token is a credential for builds on that node and nothing else: the
+panel only accepts logs and results from a node for deployments that node
+claimed and is still building, and never serves a remote deployment from the
+panel's own disk or ports.
 
 Give `--edge-url` an address the panel can reach: a LAN address, a tailnet
 address, a private VPC address. If the node is genuinely unreachable, keep its

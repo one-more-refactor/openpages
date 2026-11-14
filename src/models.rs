@@ -149,6 +149,12 @@ impl Deployment {
     pub fn is_preview(&self) -> bool {
         self.kind == "preview"
     }
+    /// Built — and so served, stopped and pruned — on the panel's own host.
+    /// A remote deployment's path and container id describe another machine
+    /// and must never be acted on here.
+    pub fn is_local(&self) -> bool {
+        self.node_id.as_deref().unwrap_or("local") == "local"
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]

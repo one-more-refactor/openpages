@@ -94,6 +94,13 @@ pub async fn run(cfg: Config) -> Result<()> {
 }
 
 impl Agent {
+    /// What the panel stores for this node, and so the key it signs edge
+    /// targets with: the SHA-256 of the secret half of the token.
+    fn edge_key(&self) -> String {
+        let secret = self.token.split_once('.').map(|(_, s)| s).unwrap_or("");
+        crate::util::sha256_hex(secret)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.panel)
     }
@@ -255,16 +262,37 @@ async fn serve_edge(agent: Agent, listen: &str) -> Result<()> {
 }
 
 async fn serve(State(agent): State<Agent>, req: Request) -> Response {
-    let Some(spec) = edge::header_str(
-        req.headers(),
-        axum::http::HeaderName::from_static(edge::TARGET_HEADER),
-    ) else {
+    let mut specs = req.headers().get_all(edge::TARGET_HEADER).iter();
+    let (Some(spec), None) = (specs.next().and_then(|v| v.to_str().ok()), specs.next()) else {
         return (
             StatusCode::BAD_REQUEST,
             "this is an openpages node edge; it only answers requests proxied by a panel\n",
         )
             .into_response();
     };
+    let spec = spec.to_string();
+
+    // Only the panel knows this node's token hash, so only the panel can say
+    // what to serve. Anything else is a stranger asking for a loopback port.
+    let signed = edge::header_str(
+        req.headers(),
+        axum::http::HeaderName::from_static(edge::SIGNATURE_HEADER),
+    )
+    .is_some_and(|sig| {
+        edge::verify_target(
+            &agent.edge_key(),
+            &spec,
+            &sig,
+            chrono::Utc::now().timestamp(),
+        )
+    });
+    if !signed {
+        return (
+            StatusCode::FORBIDDEN,
+            "unsigned or stale target — is this node's clock right, and its token current?\n",
+        )
+            .into_response();
+    }
 
     match spec.split_once(':') {
         Some(("container", port)) => match port.parse::<u16>() {
@@ -284,5 +312,76 @@ async fn serve(State(agent): State<Agent>, req: Request) -> Response {
             edge::serve_static(&dir, &rules, req).await
         }
         _ => (StatusCode::BAD_REQUEST, "unrecognised target").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn agent(dir: &std::path::Path) -> Agent {
+        let mut cfg = Config::default();
+        cfg.server.data_dir = dir.to_path_buf();
+        Agent {
+            panel: String::new(),
+            token: "n_test.s3cret".into(),
+            cfg: Arc::new(cfg),
+            rt: Runtime::Podman,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn req(headers: &[(&str, &str)]) -> Request {
+        let mut b = Request::builder().uri("/");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_node_edge_refuses_targets_the_panel_did_not_sign() {
+        let d = tempfile::tempdir().unwrap();
+        let a = agent(d.path());
+        let now = chrono::Utc::now().timestamp();
+        let spec = "container:18999";
+
+        let unsigned = serve(State(a.clone()), req(&[(edge::TARGET_HEADER, spec)])).await;
+        assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+
+        let wrong_key = edge::sign_target(&crate::util::sha256_hex("guess"), spec, now);
+        let forged = serve(
+            State(a.clone()),
+            req(&[
+                (edge::TARGET_HEADER, spec),
+                (edge::SIGNATURE_HEADER, &wrong_key),
+            ]),
+        )
+        .await;
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+        let two = serve(
+            State(a.clone()),
+            req(&[
+                (edge::TARGET_HEADER, spec),
+                (edge::TARGET_HEADER, "static:x/1"),
+            ]),
+        )
+        .await;
+        assert_eq!(two.status(), StatusCode::BAD_REQUEST);
+
+        // Signed with the token hash the panel holds: accepted, and answered
+        // with "no such deployment" rather than a refusal.
+        let good = edge::sign_target(&crate::util::sha256_hex("s3cret"), "static:blog/1", now);
+        let ok = serve(
+            State(a),
+            req(&[
+                (edge::TARGET_HEADER, "static:blog/1"),
+                (edge::SIGNATURE_HEADER, &good),
+            ]),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::NOT_FOUND);
     }
 }

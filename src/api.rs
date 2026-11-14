@@ -510,7 +510,7 @@ async fn remove_site(
         .ok_or_else(|| missing("site"))?;
 
     for d in db::deployments_for(&state.db, id, 1000).await? {
-        if let Some(cid) = d.container_id.as_deref() {
+        if let (true, Some(cid)) = (d.is_local(), d.container_id.as_deref()) {
             let _ = crate::runtime::stop(state.rt, cid, 5).await;
         }
     }
@@ -999,12 +999,34 @@ struct NodeLogs {
     lines: Vec<(String, String)>,
 }
 
+/// A node may speak only for deployments it claimed, and only while it is
+/// building them. Without this any node token could rewrite any deployment —
+/// including the panel's own — and point it at a path or port on the panel.
+fn node_may_report(
+    node: &crate::models::Node,
+    d: &crate::models::Deployment,
+) -> Result<bool, Fail> {
+    if d.node_id.as_deref().unwrap_or("local") != node.id {
+        return Err(Fail(
+            StatusCode::FORBIDDEN,
+            "that deployment is not this node's".into(),
+        ));
+    }
+    Ok(d.state() == DeployState::Building)
+}
+
 async fn node_logs(
     State(state): State<Shared>,
     headers: HeaderMap,
     Json(b): Json<NodeLogs>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    node_auth(&state, &headers).await?;
+    let node = node_auth(&state, &headers).await?;
+    let d = db::deployment(&state.db, b.deployment_id)
+        .await?
+        .ok_or_else(|| missing("deployment"))?;
+    if !node_may_report(&node, &d)? {
+        return Ok(Json(json!({ "ok": true, "ignored": "not building" })));
+    }
     db::append_logs(&state.db, b.deployment_id, &b.lines).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -1012,17 +1034,31 @@ async fn node_logs(
 async fn node_result(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(out): Json<crate::models::BuildOutcome>,
+    Json(mut out): Json<crate::models::BuildOutcome>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    node_auth(&state, &headers).await?;
+    let node = node_auth(&state, &headers).await?;
     let d = db::deployment(&state.db, out.deployment_id)
         .await?
         .ok_or_else(|| missing("deployment"))?;
+    if !node_may_report(&node, &d)? {
+        // A retry of a result that already landed. Nothing to write.
+        return Ok(Json(json!({ "ok": true, "ignored": "already reported" })));
+    }
     let site = db::site(&state.db, d.site_id)
         .await?
         .ok_or_else(|| missing("site"))?;
 
     // A remote node proved its own artifact; the panel cannot see that disk.
+    // What it says about paths and ports describes the node, not this host,
+    // so the path is recorded in the node's terms and the port must be one.
+    if out.artifact_path.is_some() {
+        out.artifact_path = Some(format!("{}/{}", site.slug, d.id));
+    }
+    if let Some(p) = out.container_port {
+        if !(1..=65535).contains(&p) {
+            return Err(bad("container_port is not a port"));
+        }
+    }
     db::finish_deployment(&state.db, &out).await?;
     if out.ok {
         db::mark_ready(&state.db, d.id).await?;
@@ -1121,6 +1157,141 @@ mod tests {
         assert!(!verify_signature(SECRET, "Hello, World!", "757107ea"));
         assert!(!verify_signature(SECRET, "Hello, World!", ""));
         assert!(!verify_signature(SECRET, "Hello, World!", "sha1=abc"));
+    }
+
+    async fn test_state() -> Shared {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open(&dir.path().join("t.db")).await.unwrap();
+        std::mem::forget(dir);
+        db::ensure_local_node(&db, "podman").await.unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.github.gh_bin = "/bin/false".into();
+        crate::state::AppState::new(cfg, crate::runtime::Runtime::Podman, None, db)
+            .await
+            .unwrap()
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    fn outcome(id: i64, path: &str) -> crate::models::BuildOutcome {
+        crate::models::BuildOutcome {
+            deployment_id: id,
+            ok: true,
+            framework: None,
+            artifact_path: Some(path.into()),
+            container_id: None,
+            container_port: None,
+            error_summary: None,
+            incident: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_token_only_reports_on_its_own_builds() {
+        let state = test_state().await;
+        let (a, a_token) = db::enroll_node(&state.db, "a").await.unwrap();
+        let (_, b_token) = db::enroll_node(&state.db, "b").await.unwrap();
+
+        // A deployment of the panel's own: no node may touch it.
+        let local = db::create_site(&state.db, "blog", "o/r", "main", "local", "auto", "")
+            .await
+            .unwrap();
+        let ld = db::create_deployment(&state.db, &local, "aaaaaaa", None, "main", "production")
+            .await
+            .unwrap();
+        db::claim_job(&state.db, "local").await.unwrap();
+        let r = node_result(
+            State(state.clone()),
+            bearer(&a_token),
+            Json(outcome(ld.id, "/etc")),
+        )
+        .await;
+        assert!(matches!(r, Err(Fail(StatusCode::FORBIDDEN, _))));
+        let r = node_logs(
+            State(state.clone()),
+            bearer(&a_token),
+            Json(NodeLogs {
+                deployment_id: ld.id,
+                lines: vec![("stdout".into(), "x".into())],
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(Fail(StatusCode::FORBIDDEN, _))));
+        let ld = db::deployment(&state.db, ld.id).await.unwrap().unwrap();
+        assert_eq!(ld.state, "building");
+        assert!(ld.artifact_path.is_none());
+
+        // Node a's own deployment: node b may not report it, node a may.
+        let remote = db::create_site(&state.db, "shop", "o/s", "main", &a, "auto", "")
+            .await
+            .unwrap();
+        let rd = db::create_deployment(&state.db, &remote, "bbbbbbb", None, "main", "production")
+            .await
+            .unwrap();
+        db::claim_job(&state.db, &a).await.unwrap();
+        let r = node_result(
+            State(state.clone()),
+            bearer(&b_token),
+            Json(outcome(rd.id, "/etc")),
+        )
+        .await;
+        assert!(matches!(r, Err(Fail(StatusCode::FORBIDDEN, _))));
+        let first = node_result(
+            State(state.clone()),
+            bearer(&a_token),
+            Json(outcome(rd.id, "/etc")),
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(first.0["ok"], true);
+        let rd = db::deployment(&state.db, rd.id).await.unwrap().unwrap();
+        assert_eq!(rd.state, "ready");
+        assert_eq!(
+            rd.artifact_path.as_deref(),
+            Some(format!("shop/{}", rd.id).as_str()),
+            "the node's path is recorded in the node's terms"
+        );
+
+        // Reported once; a second result is a no-op.
+        let again = node_result(
+            State(state.clone()),
+            bearer(&a_token),
+            Json(outcome(rd.id, "/x")),
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(again.0["ignored"], "already reported");
+
+        // Live, but the node has no edge: the panel must not serve it from its
+        // own disk.
+        db::promote(&state.db, remote.id, rd.id).await.unwrap();
+        state.invalidate_routes().await;
+        assert!(edge::resolve(&state, "shop.pages.localhost")
+            .await
+            .is_none());
+
+        db::touch_node(
+            &state.db,
+            &a,
+            "podman",
+            "0",
+            "linux",
+            Some("http://10.0.0.5:8789"),
+        )
+        .await
+        .unwrap();
+        state.invalidate_routes().await;
+        let route = edge::resolve(&state, "shop.pages.localhost").await.unwrap();
+        assert!(matches!(route.target, edge::Target::Remote { .. }));
     }
 
     #[test]

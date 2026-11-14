@@ -33,11 +33,43 @@ pub enum Target {
     Remote {
         base: String,
         spec: String,
+        /// The node's token hash: the key the panel signs `spec` with.
+        key: String,
     },
 }
 
 /// The contract between the panel's edge and a node's edge.
 pub const TARGET_HEADER: &str = "x-openpages-target";
+/// `<unix seconds>.<hex HMAC-SHA256 of "<ts>\n<spec>">`, keyed with the node's
+/// token hash. Without it a node's edge would be an open proxy to its own
+/// loopback for anyone who can reach it — or who can send a header through
+/// the panel.
+pub const SIGNATURE_HEADER: &str = "x-openpages-signature";
+/// How far apart the panel's and a node's clocks may be.
+const SIGNATURE_SKEW_SECS: i64 = 300;
+
+fn target_mac(key: &str, spec: &str, ts: i64) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key length");
+    mac.update(format!("{ts}\n{spec}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn sign_target(key: &str, spec: &str, ts: i64) -> String {
+    format!("{ts}.{}", target_mac(key, spec, ts))
+}
+
+pub fn verify_target(key: &str, spec: &str, signature: &str, now: i64) -> bool {
+    let Some((ts, mac)) = signature.split_once('.') else {
+        return false;
+    };
+    let Ok(ts) = ts.parse::<i64>() else {
+        return false;
+    };
+    (now - ts).abs() <= SIGNATURE_SKEW_SECS
+        && crate::util::secret_eq(&target_mac(key, spec, ts), &mac.to_ascii_lowercase())
+}
 
 #[derive(Clone, Debug)]
 pub struct Route {
@@ -125,11 +157,12 @@ async fn resolve_uncached(state: &Shared, host: &str) -> Option<Route> {
             .flatten()?,
     };
 
-    // A deployment built on another node is served by that node.
-    let node_id = deployment.node_id.clone().unwrap_or_else(|| "local".into());
-    if node_id != "local" {
+    // A deployment built on another node is served by that node, or not at
+    // all: its path and port describe that machine, not this one.
+    if !deployment.is_local() {
+        let node_id = deployment.node_id.clone().unwrap_or_default();
         if let Ok(Some(node)) = db::node(&state.db, &node_id).await {
-            if let Some(base) = node.edge_url {
+            if let (Some(base), Some(key)) = (node.edge_url, node.token_hash) {
                 let spec = match deployment.container_port {
                     Some(port) => format!("container:{port}"),
                     None => format!("static:{}/{}", site.slug, deployment.id),
@@ -137,10 +170,11 @@ async fn resolve_uncached(state: &Shared, host: &str) -> Option<Route> {
                 return Some(Route {
                     site_id: site.id,
                     deployment_id: deployment.id,
-                    target: Target::Remote { base, spec },
+                    target: Target::Remote { base, spec, key },
                 });
             }
         }
+        return None;
     }
 
     let target = if let Some(port) = deployment.container_port {
@@ -175,7 +209,10 @@ pub async fn handle(State(state): State<Shared>, req: Request) -> Response {
     let mut response = match route.target.clone() {
         Target::Static { dir, rules } => serve_static(&dir, &rules, req).await,
         Target::Container { port } => proxy(&format!("http://127.0.0.1:{port}"), req, None).await,
-        Target::Remote { base, spec } => proxy(&base, req, Some(&spec)).await,
+        Target::Remote { base, spec, key } => {
+            let sig = sign_target(&key, &spec, chrono::Utc::now().timestamp());
+            proxy(&base, req, Some((&spec, &sig))).await
+        }
     };
 
     // Which deployment answered. The difference between "the swap did not
@@ -551,7 +588,8 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
+/// `target` is the node-edge spec and its signature, when proxying to a node.
+pub async fn proxy(base: &str, req: Request, target: Option<(&str, &str)>) -> Response {
     let (parts, body) = req.into_parts();
     let path_q = parts
         .uri
@@ -568,7 +606,10 @@ pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
     let mut out = client().request(parts.method.clone(), &url);
     for (k, v) in parts.headers.iter() {
         let name = k.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&name.as_str()) || name == "host" {
+        // `x-openpages-*` is ours. A visitor who could send it would choose
+        // what a node serves; a site container has no business seeing it.
+        if HOP_BY_HOP.contains(&name.as_str()) || name == "host" || name.starts_with("x-openpages-")
+        {
             continue;
         }
         out = out.header(k, v);
@@ -577,8 +618,10 @@ pub async fn proxy(base: &str, req: Request, spec: Option<&str>) -> Response {
     if let Some(h) = parts.headers.get(header::HOST) {
         out = out.header("x-forwarded-host", h);
     }
-    if let Some(spec) = spec {
-        out = out.header(TARGET_HEADER, spec);
+    if let Some((spec, sig)) = target {
+        out = out
+            .header(TARGET_HEADER, spec)
+            .header(SIGNATURE_HEADER, sig);
     }
 
     let resp = match out.body(bytes).send().await {
@@ -781,6 +824,72 @@ mod tests {
         }
         assert_eq!(get(d, "/about").await, (StatusCode::OK, "about".into()));
         assert_eq!(get(d, "/").await, (StatusCode::OK, "home".into()));
+    }
+
+    #[test]
+    fn a_target_signature_binds_the_key_the_spec_and_the_time() {
+        let sig = sign_target("k", "container:3000", 1_000);
+        assert!(verify_target("k", "container:3000", &sig, 1_000));
+        assert!(verify_target("k", "container:3000", &sig, 1_299));
+        assert!(!verify_target("k", "container:3000", &sig, 1_301), "stale");
+        assert!(
+            !verify_target("other", "container:3000", &sig, 1_000),
+            "wrong key"
+        );
+        assert!(
+            !verify_target("k", "container:18999", &sig, 1_000),
+            "spec swapped"
+        );
+        assert!(!verify_target("k", "container:3000", "", 1_000));
+        assert!(!verify_target("k", "container:3000", "1000.zz", 1_000));
+    }
+
+    /// A loopback upstream that answers with every `x-openpages-*` header it
+    /// received, one per line.
+    async fn echo_upstream() -> String {
+        use axum::routing::get;
+        let app = axum::Router::new().fallback(get(|headers: HeaderMap| async move {
+            headers
+                .iter()
+                .filter(|(k, _)| k.as_str().starts_with("x-openpages-"))
+                .map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_visitor_cannot_choose_what_a_node_serves() {
+        let base = echo_upstream().await;
+        let forged = || {
+            Request::builder()
+                .uri("/")
+                .header(TARGET_HEADER, "container:18999")
+                .header(SIGNATURE_HEADER, "1.forged")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = proxy(&base, forged(), Some(("static:blog/4", "9.sig"))).await;
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let seen = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            seen,
+            "x-openpages-target=static:blog/4\nx-openpages-signature=9.sig"
+        );
+
+        // And a site container is not shown them at all.
+        let resp = proxy(&base, forged(), None).await;
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "");
     }
 
     #[test]

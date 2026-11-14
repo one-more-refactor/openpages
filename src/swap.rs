@@ -143,7 +143,7 @@ pub async fn promote(state: &Shared, d: &Deployment, why: &str) -> Result<()> {
         // it. Give them their drain window before anything is torn down.
         tokio::time::sleep(Duration::from_secs(drain)).await;
         if let Ok(Some(prev)) = db::deployment(&state2.db, prev_id).await {
-            if let Some(cid) = prev.container_id.as_deref() {
+            if let (true, Some(cid)) = (prev.is_local(), prev.container_id.as_deref()) {
                 let _ = runtime::stop(state2.rt, cid, 10).await;
             }
         }
@@ -164,7 +164,7 @@ pub async fn rollback(state: &Shared, site_id: i64, reason: &str) -> Result<Opti
 
     if let Some(current) = db::live_deployment(&state.db, site_id).await? {
         db::set_deploy_state(&state.db, current.id, DeployState::Failed).await?;
-        if let Some(cid) = current.container_id.as_deref() {
+        if let (true, Some(cid)) = (current.is_local(), current.container_id.as_deref()) {
             let _ = runtime::stop(state.rt, cid, 5).await;
         }
     }
@@ -218,17 +218,31 @@ async fn watchdog(state: &Shared) -> Result<()> {
 async fn housekeeping(state: &Shared) -> Result<()> {
     db::prune_traffic(&state.db, 30).await?;
     for d in db::prunable(&state.db, state.cfg.build.keep_deployments).await? {
-        if let Some(path) = d.artifact_path.as_deref() {
-            if path.starts_with(&state.cfg.deployments_dir().to_string_lossy().to_string()) {
-                let _ = tokio::fs::remove_dir_all(path).await;
+        if d.is_local() {
+            if let Some(path) = d.artifact_path.as_deref() {
+                if prunable_path(&state.cfg.deployments_dir(), path) {
+                    let _ = tokio::fs::remove_dir_all(path).await;
+                }
             }
-        }
-        if let Some(cid) = d.container_id.as_deref() {
-            let _ = runtime::stop(state.rt, cid, 5).await;
+            if let Some(cid) = d.container_id.as_deref() {
+                let _ = runtime::stop(state.rt, cid, 5).await;
+            }
         }
         db::mark_retired(&state.db, d.id).await?;
     }
     Ok(())
+}
+
+/// Strictly inside the deployment store, by components: a string prefix
+/// check lets `<store>/../../home` through, and a `remove_dir_all` there is
+/// not recoverable.
+pub fn prunable_path(store: &std::path::Path, path: &str) -> bool {
+    use std::path::Component;
+    let p = std::path::Path::new(path);
+    p != store
+        && p.starts_with(store)
+        && p.components()
+            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
 }
 
 #[cfg(test)]
@@ -245,6 +259,26 @@ mod tests {
             profile: vec![],
             quiet_quantile: 0.25,
         }
+    }
+
+    #[test]
+    fn pruning_never_leaves_the_deployment_store() {
+        let store = std::path::Path::new("/var/lib/openpages/deployments");
+        assert!(prunable_path(
+            store,
+            "/var/lib/openpages/deployments/blog/4"
+        ));
+        assert!(!prunable_path(store, "/var/lib/openpages/deployments"));
+        assert!(!prunable_path(
+            store,
+            "/var/lib/openpages/deployments/../../../home/openpages"
+        ));
+        assert!(!prunable_path(
+            store,
+            "/var/lib/openpages/deployments-old/x"
+        ));
+        assert!(!prunable_path(store, "/etc"));
+        assert!(!prunable_path(store, "blog/4"), "a remote node's path");
     }
 
     #[test]
