@@ -47,6 +47,24 @@ pub async fn setting(db: &Db, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.get::<String, _>("value")))
 }
 
+pub async fn delete_setting(db: &Db, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(key)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Sign-in codes that can no longer be used. Their values are RFC 3339
+/// expiry times (or `used`, from older versions), so a string compare works.
+pub async fn prune_claim_codes(db: &Db) -> Result<()> {
+    sqlx::query("DELETE FROM settings WHERE key LIKE 'claim:%' AND (value < ? OR value = 'used')")
+        .bind(now())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES(?, ?)

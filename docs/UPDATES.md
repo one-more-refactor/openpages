@@ -95,8 +95,15 @@ release workflow refuses to publish one in the first place.
 
 **`release`** is the default. The asset name is `openpages-<arch>-linux`, pinned
 in both the updater and the release workflow, and verified against the
-published `.sha256`. If a release ships without a checksum, openpages warns and
-proceeds — say so out loud rather than silently skipping the check.
+published `.sha256`. A release without a checksum is refused (before 0.1.5 it
+was installed with a warning), and so is a download that does not match.
+
+The checksum comes from the same GitHub release as the binary, so it proves the
+download is the file that was published — not who published it. Releases are
+not signed yet. Whoever can publish a release in `update.repo` can ship code to
+every install with `auto_apply = true`, unattended, within about an hour. If
+that is more trust than you want to extend, set `auto_apply = false` and apply
+updates from the panel after reading the release.
 
 **`source`** compiles on the machine. It is the reason `load_threshold` exists:
 nothing starts until the one-minute load average per core is below it (0.5 by

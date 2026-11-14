@@ -98,7 +98,7 @@ is valid. The fields worth knowing:
 
 ```toml
 [server]
-listen = "0.0.0.0:8788"
+listen = "127.0.0.1:8788"               # default 0.0.0.0; loopback when a proxy fronts it
 base_domain = "pages.example.com"       # sites live at <name>.<this>
 panel_host = "openpages.example.com"    # beats any site with the same name
 public_url = "https://openpages.example.com"   # unset ⇒ poll instead of webhooks

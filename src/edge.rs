@@ -19,6 +19,8 @@ use std::sync::{Arc, OnceLock};
 use crate::db;
 use crate::state::{CachedRoute, Shared, ROUTE_TTL};
 
+const ROUTE_CACHE_MAX: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub enum Target {
     Static {
@@ -125,7 +127,13 @@ pub async fn resolve(state: &Shared, host: &str) -> Option<Route> {
         }
     }
     let route = resolve_uncached(state, host).await;
-    state.routes.write().await.insert(
+    let mut cache = state.routes.write().await;
+    // Host is chosen by whoever sends the request. Without a bound, a flood of
+    // made-up names grows this map until the process runs out of memory.
+    if cache.len() >= ROUTE_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(
         host.to_string(),
         CachedRoute {
             at: std::time::Instant::now(),

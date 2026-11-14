@@ -61,13 +61,21 @@ One listener serves the panel and every site. The Host header decides:
 | `openpages.example.com` (`panel_host`) | the panel and the API                      |
 | `name.pages.example.com`            | that site's live deployment                   |
 | `sha--name.pages.example.com`        | that specific deployment, live or not         |
-| anything else                       | 404                                            |
+| anything else                       | the panel and the API, as for `panel_host`     |
 
 Host classification runs as the outermost middleware, so a request arriving at
 a *site* hostname never reaches an API route — not `/api/sites`, not
 `/healthz`. That is one function, `edge::classify`, and it is unit-tested,
 because it is the whole authorisation boundary between "a page you published"
 and "the thing that publishes pages".
+
+That last row is deliberate — a node may dial the panel by IP, and the Caddy
+`ask` hook arrives as `127.0.0.1` — but it means the panel answers on any name
+that reaches the listener. Behind a reverse proxy, set `listen` to
+`127.0.0.1:8788` so the plain-HTTP port is not reachable from outside. When
+`public_url` is `https://…`, the session cookie is `Secure`; panel responses
+carry `X-Frame-Options: DENY`, and state-changing requests from another origin
+(any hosted site included) are refused.
 
 Static responses carry `x-openpages-deployment: <id>`. "The swap did not
 happen" and "the swap happened and the page is still wrong" are otherwise the

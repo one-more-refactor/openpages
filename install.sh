@@ -61,16 +61,14 @@ If there is no release yet, build it instead:
   cargo build --release
   sudo ./target/release/openpages install"
 
-if curl -fsSL "$BASE/$ASSET.sha256" -o "$TMP/sum" 2>/dev/null; then
-  EXPECTED="$(cut -d' ' -f1 < "$TMP/sum")"
-  if have sha256sum; then ACTUAL="$(sha256sum "$TMP/openpages" | cut -d' ' -f1)"
-  elif have shasum;    then ACTUAL="$(shasum -a 256 "$TMP/openpages" | cut -d' ' -f1)"
-  else ACTUAL="$EXPECTED"; say "warning: no sha256sum available, skipping the checksum"; fi
-  [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch — refusing to install"
-  say "Checksum ok."
-else
-  say "warning: this release publishes no checksum."
-fi
+curl -fsSL "$BASE/$ASSET.sha256" -o "$TMP/sum" 2>/dev/null \
+  || die "this release publishes no checksum — refusing to install"
+EXPECTED="$(cut -d' ' -f1 < "$TMP/sum")"
+if have sha256sum; then ACTUAL="$(sha256sum "$TMP/openpages" | cut -d' ' -f1)"
+elif have shasum;    then ACTUAL="$(shasum -a 256 "$TMP/openpages" | cut -d' ' -f1)"
+else die "need sha256sum or shasum to verify the download"; fi
+[ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch — refusing to install"
+say "Checksum ok."
 
 chmod +x "$TMP/openpages"
 

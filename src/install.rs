@@ -235,6 +235,15 @@ pub async fn run(args: Args, mut cfg: Config) -> Result<()> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+        // The config can hold a node token, which is a credential: readable
+        // by the service user only.
+        if path == &paths.config {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            if !args.scope.is_user() {
+                chown(path, &args.user)?;
+            }
+        }
     }
     std::fs::create_dir_all(&cfg.server.data_dir)?;
     std::fs::create_dir_all(&cfg.update.install_dir)?;

@@ -68,6 +68,7 @@ pub fn router(state: Shared) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/tls-ask", get(tls_ask))
         .nest("/api", open.merge(protected))
         .fallback(panel)
         .layer(middleware::from_fn_with_state(state.clone(), host_gate))
@@ -170,12 +171,34 @@ type ApiResult<T> = std::result::Result<T, Fail>;
 /// password to guess and no OAuth app to register; proving you can run a
 /// command on the box is the proof. See docs/GITHUB.md for why.
 pub async fn mint_claim_code(db: &db::Db, minutes: i64) -> Result<String> {
+    db::prune_claim_codes(db).await?;
     let raw = crate::util::random_token(5).to_uppercase();
     let code = format!("{}-{}", &raw[0..5], &raw[5..10]);
     let expires = (chrono::Utc::now() + chrono::Duration::minutes(minutes))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    db::set_setting(db, &format!("claim:{code}"), &expires).await?;
+    db::set_setting(db, &claim_key(&code), &expires).await?;
     Ok(code)
+}
+
+/// Codes are stored hashed, like sessions: a copy of the database — or of
+/// its WAL — must not contain a working sign-in.
+fn claim_key(code: &str) -> String {
+    format!("claim:{}", crate::util::sha256_hex(code))
+}
+
+/// `Secure` whenever the panel is reached over https, so the session never
+/// travels over the plain-HTTP listener behind the proxy.
+fn session_cookie(state: &Shared, value: &str, max_age: i64) -> String {
+    let secure = state
+        .cfg
+        .server
+        .public_url
+        .as_deref()
+        .is_some_and(|u| u.starts_with("https://"));
+    format!(
+        "{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 #[derive(Deserialize)]
@@ -185,14 +208,14 @@ struct ClaimBody {
 
 async fn claim(State(state): State<Shared>, Json(body): Json<ClaimBody>) -> ApiResult<Response> {
     let code = body.code.trim().to_uppercase();
-    let key = format!("claim:{code}");
+    let key = claim_key(&code);
     let Some(expires) = db::setting(&state.db, &key).await? else {
         return Err(Fail(
             StatusCode::UNAUTHORIZED,
             "that code is not valid".into(),
         ));
     };
-    db::set_setting(&state.db, &key, "used").await?;
+    db::delete_setting(&state.db, &key).await?;
     if expires == "used"
         || crate::util::parse_ts(&expires)
             .map(|t| t < chrono::Utc::now())
@@ -221,10 +244,7 @@ async fn claim(State(state): State<Shared>, Json(body): Json<ClaimBody>) -> ApiR
     };
 
     let token = db::create_session(&state.db, user.id, 30).await?;
-    let cookie = format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-        30 * 86400
-    );
+    let cookie = session_cookie(&state, &token, 30 * 86400);
     Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
 }
 
@@ -240,10 +260,7 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> ApiResult<Re
         db::drop_session(&state.db, &t).await?;
     }
     Ok((
-        [(
-            header::SET_COOKIE,
-            format!("{COOKIE}=; Path=/; HttpOnly; Max-Age=0"),
-        )],
+        [(header::SET_COOKIE, session_cookie(&state, "", 0))],
         Json(json!({ "ok": true })),
     )
         .into_response())
@@ -287,6 +304,46 @@ async fn healthz(State(state): State<Shared>) -> Response {
     match sqlx::query("SELECT 1").fetch_one(&state.db).await {
         Ok(_) => (StatusCode::OK, "ok\n").into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("database: {e}\n")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AskQuery {
+    #[serde(default)]
+    domain: String,
+}
+
+/// Caddy's on-demand TLS `ask`: 200 only for a hostname this install serves —
+/// the panel, a site that exists, or a proof of one. `/healthz` answered yes
+/// to everything, so anyone pointing DNS here could have certificates issued
+/// for unlimited names.
+async fn tls_ask(State(state): State<Shared>, Query(q): Query<AskQuery>) -> StatusCode {
+    let domain = q.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let known = match edge::classify(
+        &domain,
+        &state.cfg.server.base_domain,
+        state.cfg.server.panel_host.as_deref(),
+    ) {
+        Host::Panel => true,
+        Host::Site { slug, preview } => match db::site_by_slug(&state.db, slug).await {
+            Ok(Some(site)) => match preview {
+                None => true,
+                Some(sha) => {
+                    site.preview_enabled != 0
+                        && matches!(
+                            db::preview_deployment(&state.db, site.id, sha).await,
+                            Ok(Some(_))
+                        )
+                }
+            },
+            _ => false,
+        },
+        Host::Unknown => false,
+    };
+    if known && !domain.contains(':') {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
     }
 }
 
@@ -1349,6 +1406,98 @@ mod tests {
         state.invalidate_routes().await;
         let route = edge::resolve(&state, "shop.pages.localhost").await.unwrap();
         assert!(matches!(route.target, edge::Target::Remote { .. }));
+    }
+
+    #[tokio::test]
+    async fn sign_in_codes_are_stored_hashed_and_work_once() {
+        let state = test_state().await;
+        let code = mint_claim_code(&state.db, 60).await.unwrap();
+        let raw: Vec<String> = sqlx::query_scalar("SELECT key || value FROM settings")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            raw.iter().all(|r| !r.contains(&code)),
+            "plaintext code in the database"
+        );
+
+        let first = claim(State(state.clone()), Json(ClaimBody { code: code.clone() })).await;
+        assert!(first.is_ok());
+        let again = claim(State(state.clone()), Json(ClaimBody { code })).await;
+        assert!(matches!(again, Err(Fail(StatusCode::UNAUTHORIZED, _))));
+        assert!(db::setting(&state.db, "webhook_secret")
+            .await
+            .unwrap()
+            .is_some());
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key LIKE 'claim:%'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "a used code is deleted, not kept");
+    }
+
+    #[tokio::test]
+    async fn tls_is_only_asked_for_names_this_install_serves() {
+        let mut cfg = crate::config::Config::default();
+        cfg.server.panel_host = Some("openpages.example.com".into());
+        cfg.server.base_domain = "pages.example.com".into();
+        cfg.github.gh_bin = "/bin/false".into();
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open(&dir.path().join("t.db")).await.unwrap();
+        std::mem::forget(dir);
+        db::ensure_local_node(&db, "podman").await.unwrap();
+        let state = crate::state::AppState::new(cfg, crate::runtime::Runtime::Podman, None, db)
+            .await
+            .unwrap();
+        db::create_site(&state.db, "blog", "o/r", "main", "local", "auto", "")
+            .await
+            .unwrap();
+
+        let ask = |d: &str| {
+            let state = state.clone();
+            let d = d.to_string();
+            async move { tls_ask(State(state), Query(AskQuery { domain: d })).await }
+        };
+        assert_eq!(ask("openpages.example.com").await, StatusCode::OK);
+        assert_eq!(ask("blog.pages.example.com").await, StatusCode::OK);
+        assert_eq!(ask("nope.pages.example.com").await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            ask("1234567--blog.pages.example.com").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(ask("evil.example.net").await, StatusCode::NOT_FOUND);
+        assert_eq!(ask("").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn expired_codes_are_pruned_and_nothing_else_is() {
+        let state = test_state().await;
+        db::set_setting(&state.db, "claim:old", "2000-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        db::set_setting(&state.db, "claim:legacy", "used")
+            .await
+            .unwrap();
+        db::set_setting(&state.db, "other", "used").await.unwrap();
+        mint_claim_code(&state.db, 60).await.unwrap();
+        let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM settings ORDER BY key")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert!(!keys.iter().any(|k| k == "claim:old" || k == "claim:legacy"));
+        assert!(keys.iter().any(|k| k == "other"));
+        assert!(keys.iter().any(|k| k == "webhook_secret"));
+        assert_eq!(keys.iter().filter(|k| k.starts_with("claim:")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_route_cache_is_bounded() {
+        let state = test_state().await;
+        for i in 0..5000 {
+            edge::resolve(&state, &format!("s{i}.pages.localhost")).await;
+        }
+        assert!(state.routes.read().await.len() <= 4096);
     }
 
     #[test]

@@ -221,10 +221,15 @@ async fn download(state: &Shared, target: &str, dest: &Path) -> Result<()> {
         .bytes()
         .await?;
 
-    if let Some(sum) = release
+    // A release without a checksum is refused, not installed with a warning:
+    // the checksum is the only thing tying the download to the release.
+    let sum = release
         .assets
         .iter()
         .find(|a| a.name == format!("{want}.sha256"))
+        .with_context(|| {
+            format!("release {target} publishes no {want}.sha256 — refusing to install it")
+        })?;
     {
         let expected = reqwest::get(&sum.browser_download_url)
             .await?
@@ -241,11 +246,9 @@ async fn download(state: &Shared, target: &str, dest: &Path) -> Result<()> {
             h.update(&bytes);
             hex::encode(h.finalize())
         };
-        if !expected.is_empty() && expected != actual {
+        if expected.len() != 64 || expected != actual {
             bail!("checksum mismatch for {want}: expected {expected}, got {actual}");
         }
-    } else {
-        tracing::warn!("release {target} publishes no .sha256 — cannot verify the download");
     }
 
     tokio::fs::write(dest, &bytes)
