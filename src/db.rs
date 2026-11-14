@@ -431,19 +431,27 @@ pub async fn rollback_target(db: &Db, site_id: i64) -> Result<Option<Deployment>
     .await?)
 }
 
+/// `sha_prefix` comes from a Host header. It must be a real abbreviated SHA
+/// and is compared exactly: it used to be a `LIKE` pattern, so `%--blog`
+/// served any unreleased build.
 pub async fn preview_deployment(
     db: &Db,
     site_id: i64,
     sha_prefix: &str,
 ) -> Result<Option<Deployment>> {
+    let prefix = sha_prefix.to_ascii_lowercase();
+    if !crate::buildpipe::is_commit_sha(&prefix) {
+        return Ok(None);
+    }
     Ok(sqlx::query_as::<_, Deployment>(
         "SELECT * FROM deployments
-         WHERE site_id = ? AND commit_sha LIKE ? AND artifact_path IS NOT NULL
+         WHERE site_id = ? AND substr(commit_sha, 1, ?) = ? AND artifact_path IS NOT NULL
            AND state IN ('ready','live','superseded','verifying')
          ORDER BY id DESC LIMIT 1",
     )
     .bind(site_id)
-    .bind(format!("{sha_prefix}%"))
+    .bind(prefix.len() as i64)
+    .bind(&prefix)
     .fetch_optional(db)
     .await?)
 }
@@ -933,6 +941,56 @@ mod tests {
             rollback_target(&db, site.id).await.unwrap().unwrap().id,
             d1.id
         );
+    }
+
+    #[tokio::test]
+    async fn a_preview_host_is_a_sha_prefix_not_a_pattern() {
+        let db = mem().await;
+        ensure_local_node(&db, "podman").await.unwrap();
+        let site = create_site(&db, "s", "o/r", "main", "local", "auto", "")
+            .await
+            .unwrap();
+        let sha = "9f3c2a1b4d5e6f708192a3b4c5d6e7f809123456";
+        let d = create_deployment(&db, &site, sha, None, "main", "production")
+            .await
+            .unwrap();
+        finish_deployment(
+            &db,
+            &BuildOutcome {
+                deployment_id: d.id,
+                ok: true,
+                framework: None,
+                artifact_path: Some("/tmp/a".into()),
+                container_id: None,
+                container_port: None,
+                error_summary: None,
+                incident: None,
+            },
+        )
+        .await
+        .unwrap();
+        mark_ready(&db, d.id).await.unwrap();
+
+        for wildcard in ["%", "_", "9", "9f3c2a", "9f3c2a1%", "9f3c2a1_", "zzzzzzz"] {
+            assert!(
+                preview_deployment(&db, site.id, wildcard)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{wildcard}"
+            );
+        }
+        for good in ["9f3c2a1", "9f3c2a1b", "9F3C2A1B", sha] {
+            assert_eq!(
+                preview_deployment(&db, site.id, good)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                d.id,
+                "{good}"
+            );
+        }
     }
 
     #[tokio::test]

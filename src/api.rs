@@ -84,8 +84,53 @@ async fn host_gate(State(state): State<Shared>, req: Request, next: Next) -> Res
         state.cfg.server.panel_host.as_deref(),
     ) {
         Host::Site { .. } => edge::handle(State(state), req).await,
-        _ => next.run(req).await,
+        _ => {
+            if !req.method().is_safe() && cross_origin(req.headers()) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "cross-origin request refused" })),
+                )
+                    .into_response();
+            }
+            let mut resp = next.run(req).await;
+            // Every hosted site is usually same-site with the panel, so it
+            // could frame it and steer clicks on Delete or Promote.
+            let h = resp.headers_mut();
+            h.insert(
+                header::X_FRAME_OPTIONS,
+                header::HeaderValue::from_static("DENY"),
+            );
+            h.insert(
+                header::CONTENT_SECURITY_POLICY,
+                header::HeaderValue::from_static("frame-ancestors 'none'"),
+            );
+            resp
+        }
     }
+}
+
+/// A browser request that a page on another origin made. Published sites sit
+/// on sibling subdomains of the panel, so `SameSite=Lax` lets their requests
+/// carry the session cookie; bodyless POSTs (rollback, promote, update) need
+/// no preflight. Browsers always send `Origin` on a POST, so comparing it with
+/// `Host` is enough; webhooks and nodes send no `Origin` and are unaffected.
+fn cross_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = edge::header_str(headers, header::HeaderName::from_static("sec-fetch-site"))
+    {
+        if site != "same-origin" && site != "none" {
+            return true;
+        }
+    }
+    let Some(origin) = edge::header_str(headers, header::ORIGIN) else {
+        return false;
+    };
+    let host = edge::header_str(headers, header::HOST).unwrap_or_default();
+    let origin_host = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&origin)
+        .trim_end_matches('/');
+    !origin_host.eq_ignore_ascii_case(&host)
 }
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -586,8 +631,9 @@ async fn deploy_site(
     let site = db::site(&state.db, id)
         .await?
         .ok_or_else(|| missing("site"))?;
-    let (sha, msg) = match b.sha.filter(|s| s.len() >= 7) {
-        Some(sha) => (sha, None),
+    let (sha, msg) = match b.sha.filter(|s| !s.trim().is_empty()) {
+        Some(sha) if crate::buildpipe::is_commit_sha(sha.trim()) => (sha.trim().to_string(), None),
+        Some(_) => return Err(bad("a commit is 7 to 40 lowercase hex digits")),
         None => {
             let c = state
                 .gh
@@ -872,7 +918,9 @@ async fn webhook(
 
     let push: PushEvent =
         serde_json::from_str(&body).map_err(|e| bad(format!("unreadable push event: {e}")))?;
-    let branch = push.git_ref.rsplit('/').next().unwrap_or("").to_string();
+    let Some(branch) = pushed_branch(&push.git_ref).map(str::to_string) else {
+        return Ok(Json(json!({ "ok": true, "ignored": push.git_ref })));
+    };
     let mut started = Vec::new();
 
     for site in db::site_by_repo(&state.db, &push.repository.full_name).await? {
@@ -897,6 +945,15 @@ async fn webhook(
         started.push(d.id);
     }
     Ok(Json(json!({ "ok": true, "deployments": started })))
+}
+
+/// `refs/heads/<branch>` → `<branch>`, whole. Tags are not deployments, and
+/// taking only the last path segment made a push to `feature/main` — or a
+/// tag called `main` — a production deploy.
+pub fn pushed_branch(git_ref: &str) -> Option<&str> {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -1292,6 +1349,108 @@ mod tests {
         state.invalidate_routes().await;
         let route = edge::resolve(&state, "shop.pages.localhost").await.unwrap();
         assert!(matches!(route.target, edge::Target::Remote { .. }));
+    }
+
+    #[test]
+    fn only_a_whole_branch_ref_is_a_branch() {
+        assert_eq!(pushed_branch("refs/heads/main"), Some("main"));
+        assert_eq!(
+            pushed_branch("refs/heads/feature/main"),
+            Some("feature/main")
+        );
+        assert_eq!(pushed_branch("refs/tags/main"), None);
+        assert_eq!(pushed_branch("refs/heads/"), None);
+        assert_eq!(pushed_branch("main"), None);
+    }
+
+    async fn call(state: &Shared, method: &str, path: &str, hdrs: &[(&str, &str)]) -> Response {
+        use tower::ServiceExt;
+        let mut b = Request::builder().method(method).uri(path);
+        for (k, v) in hdrs {
+            b = b.header(*k, *v);
+        }
+        router(state.clone())
+            .oneshot(b.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_hosted_site_cannot_drive_or_frame_the_panel() {
+        let state = test_state().await;
+        let panel = "openpages.localhost:8788";
+
+        // The audit's request: from a site, cookie attached, no preflight.
+        let csrf = call(
+            &state,
+            "POST",
+            "/api/auth/logout",
+            &[
+                ("host", panel),
+                ("origin", "http://evil.pages.localhost:8788"),
+                ("sec-fetch-site", "same-site"),
+                ("content-type", "text/plain"),
+            ],
+        )
+        .await;
+        assert_eq!(csrf.status(), StatusCode::FORBIDDEN);
+
+        let without_fetch_metadata = call(
+            &state,
+            "POST",
+            "/api/auth/logout",
+            &[
+                ("host", panel),
+                ("origin", "http://evil.pages.localhost:8788"),
+            ],
+        )
+        .await;
+        assert_eq!(without_fetch_metadata.status(), StatusCode::FORBIDDEN);
+
+        let same_origin = call(
+            &state,
+            "POST",
+            "/api/auth/logout",
+            &[
+                ("host", panel),
+                ("origin", "http://openpages.localhost:8788"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        )
+        .await;
+        assert_eq!(same_origin.status(), StatusCode::OK);
+
+        let no_browser = call(&state, "POST", "/api/auth/logout", &[("host", panel)]).await;
+        assert_eq!(
+            no_browser.status(),
+            StatusCode::OK,
+            "curl, nodes and webhooks"
+        );
+
+        let page = call(&state, "GET", "/", &[("host", panel)]).await;
+        assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(
+            page.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'none'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deploy_sha_cannot_be_a_git_option() {
+        let state = test_state().await;
+        let site = db::create_site(&state.db, "blog", "o/r", "main", "local", "auto", "")
+            .await
+            .unwrap();
+        let r = deploy_site(
+            State(state),
+            Path(site.id),
+            Json(DeployBody {
+                sha: Some("--upload-pack=touch PWNED; git-upload-pack".into()),
+                preview: false,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(Fail(StatusCode::BAD_REQUEST, _))));
     }
 
     #[test]
