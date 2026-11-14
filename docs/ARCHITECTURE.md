@@ -17,7 +17,7 @@ deployments row, state = queued, pinned to one commit SHA
    │  claimed by exactly one worker — an UPDATE with `state = 'queued'` as the lock
    ▼
 buildpipe                                         (src/buildpipe.rs)
-   ├─ git fetch --depth 1 <sha>  · on the host, so the token never enters a container
+   ├─ git fetch --depth 1 <sha>  · on the host; the token is a header, never in .git/config
    ├─ detect framework                            (src/detect.rs)
    ├─ container: install && build                 (src/runtime.rs)
    └─ verify: non-empty, contains HTML, under the size cap
@@ -110,8 +110,17 @@ acting on noise means swapping at a moment that only looked quiet.
 reason a remote node can run the identical code path with nothing but a
 container runtime and `git`.
 
-- The clone happens **on the host**, so the GitHub token is never inside the
-  build container.
+- The clone happens **on the host**. The GitHub token reaches `git` only as an
+  `Authorization` header in that process's environment — it is not in the
+  remote URL, so it is not in `.git/config`, and the workspace the build
+  container mounts (and a Dockerfile build uses as its context) holds no
+  credential. Versions before 0.1.5 put the token in the remote URL; it was
+  readable from inside every build.
+- The workspace is deleted after every build, failed or not.
+- Symlinks are never published. They are removed from the output before it
+  moves into the deployment store, a root or output directory that is a
+  symlink fails the build, and the edge refuses to serve any file that does
+  not resolve inside its deployment directory.
 - A single commit is fetched, not a branch.
 - The build runs in a container with a bind-mounted workspace. Under rootless
   Podman, container-root is the invoking user, so the output is readable;

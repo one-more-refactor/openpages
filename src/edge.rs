@@ -230,7 +230,7 @@ pub async fn serve_static(dir: &Path, rules: &Rules, req: Request) -> Response {
     }
 
     let custom = dir.join("404.html");
-    if custom.is_file() {
+    if file_within(dir, &custom) {
         return send_file(&custom, 404, &path, rules, req.headers()).await;
     }
     (
@@ -245,22 +245,35 @@ pub async fn serve_static(dir: &Path, rules: &Rules, req: Request) -> Response {
 /// static site generators disagree about which one they emit.
 async fn pick_file(dir: &Path, rel: &str) -> Option<(PathBuf, u16)> {
     let base = dir.join(rel);
-    if base.is_file() {
+    if file_within(dir, &base) {
         return Some((base, 200));
     }
     if base.is_dir() {
         let idx = base.join("index.html");
-        if idx.is_file() {
+        if file_within(dir, &idx) {
             return Some((idx, 200));
         }
     }
     if !rel.is_empty() {
         let with_html = dir.join(format!("{}.html", rel.trim_end_matches('/')));
-        if with_html.is_file() {
+        if file_within(dir, &with_html) {
             return Some((with_html, 200));
         }
     }
     None
+}
+
+/// A regular file that really lives inside `dir`. `safe_join` only reasons
+/// about the text of a path; this asks the filesystem, so a symlink that a
+/// build left behind (`x.css -> /var/lib/openpages/openpages.db`, `root -> /`)
+/// resolves to somewhere outside and is refused. The build pipeline removes
+/// symlinks before publishing; this is the second lock on the same door.
+pub fn file_within(dir: &Path, candidate: &Path) -> bool {
+    let (Ok(root), Ok(real)) = (std::fs::canonicalize(dir), std::fs::canonicalize(candidate))
+    else {
+        return false;
+    };
+    real.starts_with(&root) && real.is_file()
 }
 
 async fn send_file(
@@ -416,11 +429,17 @@ pub enum Redirect {
 
 impl Rules {
     pub fn load(dir: &Path) -> Self {
+        let read = |name: &str| {
+            let p = dir.join(name);
+            file_within(dir, &p)
+                .then(|| std::fs::read_to_string(p).ok())
+                .flatten()
+        };
         Self {
-            redirects: std::fs::read_to_string(dir.join("_redirects"))
+            redirects: read("_redirects")
                 .map(|s| parse_redirects(&s))
                 .unwrap_or_default(),
-            headers: std::fs::read_to_string(dir.join("_headers"))
+            headers: read("_headers")
                 .map(|s| parse_headers(&s))
                 .unwrap_or_default(),
         }
@@ -725,6 +744,43 @@ mod tests {
         assert_eq!(root.len(), 1);
         assert_eq!(root[0].0, "X-Frame-Options");
         assert_eq!(rules.headers_for("/admin/x").len(), 2);
+    }
+
+    async fn get(dir: &Path, path: &str) -> (StatusCode, String) {
+        let rules = Rules::load(dir);
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = serve_static(dir, &rules, req).await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn symlinks_in_a_deployment_are_never_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP-SECRET").unwrap();
+        std::fs::write(outside.path().join("rules"), "/* /secret.txt 200\n").unwrap();
+
+        let site = tempfile::tempdir().unwrap();
+        let d = site.path();
+        std::fs::write(d.join("index.html"), "home").unwrap();
+        std::fs::write(d.join("about.html"), "about").unwrap();
+        let link = |to: &Path, name: &str| std::os::unix::fs::symlink(to, d.join(name)).unwrap();
+        link(&outside.path().join("secret.txt"), "leak");
+        link(&outside.path().join("secret.txt"), "page.html");
+        link(&outside.path().join("secret.txt"), "404.html");
+        link(&outside.path().join("rules"), "_redirects");
+        link(outside.path(), "root");
+
+        for path in ["/leak", "/page", "/root/secret.txt", "/root/", "/nope"] {
+            let (status, body) = get(d, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert!(!body.contains("TOP-SECRET"), "{path} leaked: {body}");
+        }
+        assert_eq!(get(d, "/about").await, (StatusCode::OK, "about".into()));
+        assert_eq!(get(d, "/").await, (StatusCode::OK, "home".into()));
     }
 
     #[test]

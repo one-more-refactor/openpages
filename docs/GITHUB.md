@@ -23,9 +23,14 @@ openpages login          # wraps `gh auth login` with the right scopes
 ```
 
 Everything after that reads the token with `gh auth token`, per operation. The
-token is never written to the openpages database. It is passed to a build only
-as part of a single `git clone` URL, and every log line is redacted against it
-before being stored or shown.
+token is never written to the openpages database or to disk. A clone gets it as
+an `Authorization` header in the environment of the `git` process on the host —
+never in the remote URL, so never in `.git/config` and never inside the build
+container. Every log line is redacted against it before being stored or shown.
+
+It is the `gh` OAuth token of the account you logged in with: long-lived, and
+scoped to every repository that account can reach. A remote node receives it
+with each job it claims, so only enrol nodes you trust as much as the panel.
 
 To switch accounts:
 
@@ -91,6 +96,6 @@ anything that could remove code.
 | List repositories | `gh repo list --source --json …` |
 | Default branch, branch head | `gh api repos/{repo}` |
 | Add / remove a push webhook | `gh api repos/{repo}/hooks` |
-| Clone for a build | `git clone` with a token in the URL |
+| Clone for a build | `git fetch` with the token as an `Authorization` header (environment, not URL) |
 | Open a repair pull request | `gh pr create` |
 | Check for an openpages release | `gh api repos/{repo}/releases/latest` |

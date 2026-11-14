@@ -34,17 +34,37 @@ pub struct BuildEnv {
 pub type LogSink = mpsc::Sender<(String, String)>;
 
 pub async fn run(job: &BuildJob, env: &BuildEnv, sink: LogSink) -> BuildOutcome {
-    let secrets: Vec<String> = job.clone_token.iter().cloned().collect();
+    // The token, and the header value it travels in, in case git echoes it.
+    let secrets: Vec<String> = job
+        .clone_token
+        .iter()
+        .cloned()
+        .chain(
+            gh::git_auth_env(job.clone_token.as_deref())
+                .into_iter()
+                .filter(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+                .filter_map(|(_, v)| v.rsplit(' ').next().map(str::to_string)),
+        )
+        .collect();
     let recorder = Recorder::new(sink, secrets.clone());
 
-    match run_inner(job, env, &recorder).await {
+    let outcome = match run_inner(job, env, &recorder).await {
         Ok(out) => out,
         Err(e) => {
             let msg = redact(&format!("{e:#}"), &secrets);
             recorder.say("stderr", &format!("openpages: {msg}")).await;
             fail(job, env, &recorder, &msg).await
         }
-    }
+    };
+    // The workspace is a clone plus a node_modules tree. Neither is worth
+    // keeping — a heal re-clones, and disk on a small server is not free — and
+    // a failed build must not leave it behind any more than a good one.
+    let _ = tokio::fs::remove_dir_all(workspace(job, env)).await;
+    outcome
+}
+
+fn workspace(job: &BuildJob, env: &BuildEnv) -> PathBuf {
+    env.work_dir.join(format!("d{}", job.deployment_id))
 }
 
 async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<BuildOutcome> {
@@ -61,7 +81,7 @@ async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<Bui
     )
     .await;
 
-    let work = env.work_dir.join(format!("d{}", job.deployment_id));
+    let work = workspace(job, env);
     let _ = tokio::fs::remove_dir_all(&work).await;
     tokio::fs::create_dir_all(&work)
         .await
@@ -80,6 +100,15 @@ async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<Bui
             job.root_dir
         );
     }
+    // The root directory is bind-mounted into the build container. A repo
+    // that commits it as a symlink to `/` would otherwise hand the build the
+    // host's whole filesystem.
+    let src = within(&work, &src).with_context(|| {
+        format!(
+            "root directory `{}` is outside the repository",
+            job.root_dir
+        )
+    })?;
 
     let recipe = detect::detect(&src);
     rec.say(
@@ -89,16 +118,11 @@ async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<Bui
     .await;
 
     let is_container = job.site_kind == "container" || recipe.kind == "container";
-    let outcome = if is_container {
-        container_build(job, env, rt, &src, rec).await?
+    if is_container {
+        container_build(job, env, rt, &src, rec).await
     } else {
-        static_build(job, env, rt, &recipe, &src, rec).await?
-    };
-
-    // The workspace is a clone plus a node_modules tree. Neither is worth
-    // keeping: a heal re-clones, and disk on a small server is not free.
-    let _ = tokio::fs::remove_dir_all(&work).await;
-    Ok(outcome)
+        static_build(job, env, rt, &recipe, &src, rec).await
+    }
 }
 
 // ── clone ───────────────────────────────────────────────────────────────────
@@ -107,9 +131,34 @@ async fn run_inner(job: &BuildJob, env: &BuildEnv, rec: &Recorder) -> Result<Bui
 /// the build starting, the branch can move, and a deployment labelled `abc1234`
 /// that actually contains `def5678` is a debugging session nobody deserves.
 async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
-    let url = gh::clone_url(&job.repo, job.clone_token.as_deref());
-    git(work, &["init", "--quiet"], rec).await?;
-    git(work, &["remote", "add", "origin", &url], rec).await?;
+    let url = gh::clone_url(&job.repo);
+    let auth = gh::git_auth_env(job.clone_token.as_deref());
+    fetch_commit(work, &url, &job.commit_sha, &auth, rec)
+        .await
+        .with_context(|| {
+            format!(
+                "fetching {} from {}",
+                crate::config::short_sha(&job.commit_sha),
+                job.repo
+            )
+        })
+}
+
+/// The credential is only ever in the environment of these git processes
+/// (`auth`), never in the remote URL, so the `.git` directory left in the
+/// workspace — which the build container mounts — holds nothing secret.
+async fn fetch_commit(
+    work: &Path,
+    url: &str,
+    sha: &str,
+    auth: &[(String, String)],
+    rec: &Recorder,
+) -> Result<()> {
+    if !is_commit_sha(sha) {
+        bail!("`{sha}` is not a commit SHA");
+    }
+    git(work, &["init", "--quiet"], &[], rec).await?;
+    git(work, &["remote", "add", "origin", url], &[], rec).await?;
     git(
         work,
         &[
@@ -118,21 +167,17 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
             "1",
             "--quiet",
             "origin",
-            &job.commit_sha,
+            "--end-of-options",
+            sha,
         ],
+        auth,
         rec,
     )
-    .await
-    .with_context(|| {
-        format!(
-            "fetching {} from {}",
-            crate::config::short_sha(&job.commit_sha),
-            job.repo
-        )
-    })?;
+    .await?;
     git(
         work,
         &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        &[],
         rec,
     )
     .await?;
@@ -150,6 +195,7 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
                 "1",
                 "--recursive",
             ],
+            auth,
             rec,
         )
         .await?;
@@ -157,12 +203,19 @@ async fn clone(job: &BuildJob, work: &Path, rec: &Recorder) -> Result<()> {
     Ok(())
 }
 
-async fn git(dir: &Path, args: &[&str], rec: &Recorder) -> Result<()> {
+/// 7 to 40 lowercase hex digits. Anything else reaching `git fetch` as a
+/// positional argument could be read as an option.
+pub fn is_commit_sha(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+async fn git(dir: &Path, args: &[&str], env: &[(String, String)], rec: &Recorder) -> Result<()> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .output()
         .await
@@ -247,7 +300,16 @@ async fn static_build(
             )
         })?;
 
-    let out_dir = src.join(rel.trim_matches('/'));
+    let out_dir = within(src, &src.join(rel.trim_matches('/')))
+        .with_context(|| format!("output directory `{rel}` is outside the repository"))?;
+    let dropped = drop_symlinks(&out_dir)?;
+    if dropped > 0 {
+        rec.say(
+            "stdout",
+            &format!("openpages: removed {dropped} symlink(s) from the output — symlinks are never published"),
+        )
+        .await;
+    }
     verify_static(&out_dir, &rel, env.max_artifact_mb)?;
 
     let dest = env
@@ -421,6 +483,46 @@ async fn container_logs(rt: Runtime, id: &str) -> String {
 }
 
 // ── artifacts ───────────────────────────────────────────────────────────────
+
+/// `path`, resolved, if it is `root` or somewhere under it and is not itself a
+/// symlink. Missing paths pass through unchanged so the caller can report them
+/// in its own words.
+fn within(root: &Path, path: &Path) -> Result<PathBuf> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(path.to_path_buf());
+    };
+    if meta.file_type().is_symlink() && path != root {
+        bail!("{} is a symlink", path.display());
+    }
+    let real_root = std::fs::canonicalize(root)?;
+    let real = std::fs::canonicalize(path)?;
+    if !real.starts_with(&real_root) {
+        bail!("{} resolves outside {}", path.display(), root.display());
+    }
+    Ok(real)
+}
+
+/// A symlink in the output is a pointer the edge would follow to wherever it
+/// points: `/`, the database, the `gh` token. A build — or any dependency's
+/// install script — can create one, so none is ever published. They are
+/// removed before the tree moves into the deployment store, and the edge
+/// refuses to follow one as well.
+fn drop_symlinks(dir: &Path) -> Result<usize> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut links = Vec::new();
+    for e in walkdir::WalkDir::new(dir).follow_links(false).min_depth(1) {
+        let e = e?;
+        if e.file_type().is_symlink() {
+            links.push(e.into_path());
+        }
+    }
+    for l in &links {
+        std::fs::remove_file(l).with_context(|| format!("removing symlink {}", l.display()))?;
+    }
+    Ok(links.len())
+}
 
 /// Move the built directory into place. A rename within the same filesystem is
 /// atomic and instant; the copy is the fallback for the case where the data dir
@@ -640,6 +742,123 @@ mod tests {
         place(&src.path().join("dist"), &to).await.unwrap();
         assert!(to.join("index.html").is_file());
         assert!(to.join("a/b.css").is_file());
+    }
+
+    #[test]
+    fn symlinks_never_reach_the_deployment_store() {
+        let outside = dir_with(&[("secret.txt", "TOP-SECRET")]);
+        let src = dir_with(&[("dist/index.html", "hi"), ("dist/a/b.css", "x")]);
+        let dist = src.path().join("dist");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dist.join("leak.css"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dist.join("a/root")).unwrap();
+
+        assert_eq!(drop_symlinks(&dist).unwrap(), 2);
+        assert!(!dist.join("leak.css").exists());
+        assert!(!dist.join("a/root").exists());
+        assert!(dist.join("a/b.css").is_file(), "real files stay");
+        assert!(
+            outside.path().join("secret.txt").is_file(),
+            "removing a link must not touch its target"
+        );
+    }
+
+    #[test]
+    fn an_output_or_root_directory_that_points_outside_is_refused() {
+        let outside = dir_with(&[("index.html", "not yours")]);
+        let src = dir_with(&[("public/index.html", "hi")]);
+        std::os::unix::fs::symlink(outside.path(), src.path().join("dist")).unwrap();
+        std::os::unix::fs::symlink(src.path().join("public"), src.path().join("alias")).unwrap();
+
+        assert!(within(src.path(), &src.path().join("dist")).is_err());
+        assert!(
+            within(src.path(), &src.path().join("alias")).is_err(),
+            "a symlink is refused even when it points inside: rename would move the link"
+        );
+        assert!(within(src.path(), &src.path().join("../")).is_err());
+        assert!(within(src.path(), &src.path().join("public")).is_ok());
+        assert!(within(src.path(), &src.path().join(".")).is_ok());
+    }
+
+    #[test]
+    fn only_a_hex_commit_sha_reaches_git() {
+        assert!(is_commit_sha("0123abc"));
+        assert!(is_commit_sha(&"a".repeat(40)));
+        assert!(!is_commit_sha("--upload-pack=touch PWNED; git-upload-pack"));
+        assert!(!is_commit_sha("abc12"));
+        assert!(!is_commit_sha("ABCDEF0"));
+        assert!(!is_commit_sha(&"a".repeat(41)));
+    }
+
+    /// A local repository with one commit, built without the user's git config
+    /// (no signing, no identity) so the test is hermetic.
+    fn fixture_repo() -> (tempfile::TempDir, String) {
+        let d = dir_with(&[("index.html", "hi")]);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+                .args(args)
+                .current_dir(d.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "one"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        (d, sha)
+    }
+
+    #[tokio::test]
+    async fn the_clone_token_is_never_written_into_the_workspace() {
+        let (origin, sha) = fixture_repo();
+        let work = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(1024);
+        let rec = Recorder::new(tx, vec![]);
+        let token = "gho_THIS_MUST_NOT_PERSIST";
+        let url = format!("file://{}", origin.path().display());
+
+        fetch_commit(
+            work.path(),
+            &url,
+            &sha,
+            &gh::git_auth_env(Some(token)),
+            &rec,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            work.path().join("index.html").is_file(),
+            "the commit was checked out"
+        );
+        for e in walkdir::WalkDir::new(work.path())
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if e.file_type().is_file() {
+                let bytes = std::fs::read(e.path()).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains(token),
+                    "token found in {}",
+                    e.path().display()
+                );
+                assert!(
+                    !text.contains("eC1hY2Nlc3MtdG9rZW46"),
+                    "encoded credential found in {}",
+                    e.path().display()
+                );
+            }
+        }
     }
 
     #[test]

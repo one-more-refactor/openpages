@@ -120,9 +120,11 @@ impl Gh {
             .unwrap_or(false)
     }
 
-    /// The token `gh` currently holds. Short-lived in the sense that it is
-    /// never stored by openpages: it is fetched per operation and handed to a
-    /// build container only for the duration of a clone.
+    /// The token `gh` currently holds. This is the owner's long-lived `gh`
+    /// OAuth token, not a short-lived one: openpages never stores it, but it
+    /// is fetched per operation and sent to whichever node claims a job. The
+    /// clone on that node runs on the host, outside the build container, and
+    /// the token is never written into the workspace.
     pub async fn token(&self) -> Result<String> {
         let t = self.run(&["auth", "token"]).await?.trim().to_string();
         if t.is_empty() {
@@ -330,16 +332,37 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-/// `https://x-access-token:<token>@github.com/owner/repo.git`
+/// `https://github.com/owner/repo.git` — never with a credential in it.
 ///
-/// This string is a credential. It is passed to the build container as an
-/// argument to a single `git clone` and never written to a log or the database
-/// — see `buildpipe::redact`.
-pub fn clone_url(repo: &str, token: Option<&str>) -> String {
-    match token {
-        Some(t) => format!("https://x-access-token:{t}@github.com/{repo}.git"),
-        None => format!("https://github.com/{repo}.git"),
-    }
+/// A token in the remote URL is written to `.git/config`, and that file sits in
+/// the workspace a build container mounts and a Dockerfile build uses as its
+/// context. Any dependency's install script could read it. The credential goes
+/// in through [`git_auth_env`] instead.
+pub fn clone_url(repo: &str) -> String {
+    format!("https://github.com/{repo}.git")
+}
+
+/// The clone credential as environment for a single git process: an
+/// `Authorization` header git sends to github.com only. Git reads
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` as if they were
+/// `-c` options, so nothing is persisted and nothing shows up in argv.
+pub fn git_auth_env(token: Option<&str>) -> Vec<(String, String)> {
+    use base64::Engine;
+    let Some(t) = token.filter(|t| !t.is_empty()) else {
+        return vec![];
+    };
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{t}"));
+    vec![
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        (
+            "GIT_CONFIG_KEY_0".into(),
+            "http.https://github.com/.extraheader".into(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".into(),
+            format!("Authorization: Basic {basic}"),
+        ),
+    ]
 }
 
 pub fn first_line(s: &str) -> &str {
@@ -351,9 +374,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clone_url_embeds_the_token_only_when_there_is_one() {
-        assert_eq!(clone_url("a/b", None), "https://github.com/a/b.git");
-        assert!(clone_url("a/b", Some("ghs_x")).contains("x-access-token:ghs_x@"));
+    fn the_clone_url_never_carries_a_credential() {
+        assert_eq!(clone_url("a/b"), "https://github.com/a/b.git");
+    }
+
+    #[test]
+    fn the_credential_travels_as_a_github_only_header() {
+        use base64::Engine;
+        assert!(git_auth_env(None).is_empty());
+        assert!(git_auth_env(Some("")).is_empty());
+        let env = git_auth_env(Some("gho_secret"));
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0").as_deref(),
+            Some("http.https://github.com/.extraheader")
+        );
+        let value = get("GIT_CONFIG_VALUE_0").unwrap();
+        let b64 = value.strip_prefix("Authorization: Basic ").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded, b"x-access-token:gho_secret");
     }
 
     #[test]

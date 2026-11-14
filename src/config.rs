@@ -397,6 +397,10 @@ fn d_claude() -> String {
 }
 fn d_claude_args() -> Vec<String> {
     [
+        // First, so the flag that follows ends its list: it takes several
+        // values and would otherwise swallow the prompt.
+        "--disallowedTools",
+        "Bash,WebFetch,WebSearch",
         "-p",
         "--output-format",
         "json",
@@ -404,6 +408,13 @@ fn d_claude_args() -> Vec<String> {
         "14",
         "--permission-mode",
         "acceptEdits",
+        // The checkout is the repository that failed; its own
+        // `.claude/settings.json` (hooks, allow-lists) and `.mcp.json` must not
+        // configure the agent that runs on this host. With no shell or web
+        // tools it can only edit files.
+        "--setting-sources",
+        "user",
+        "--strict-mcp-config",
     ]
     .iter()
     .map(|s| s.to_string())

@@ -207,7 +207,9 @@ pub struct BuildJob {
     pub runtime: String,
     pub env: Vec<(String, String)>,
     pub timeout_secs: u64,
-    /// Short-lived GitHub token for the clone. Never persisted.
+    /// The owner's `gh` token, for the clone. Long-lived: a node that
+    /// receives a job holds it. Used only as a header in git's environment on
+    /// the node's host — never written to disk or passed into a container.
     pub clone_token: Option<String>,
 }
 

@@ -63,6 +63,24 @@ The distilled report, plus:
 It runs in a throwaway clone under `data_dir/heal/`, with your own Claude
 credentials, on your own machine. Nothing is sent anywhere else.
 
+**It runs on the host, not in a container, over input the build controls.** The
+report is whatever the failing build printed, and the build runs the
+repository's code and every dependency's install script. openpages fences the
+report and tells the model it is untrusted data, and since 0.1.5:
+
+- the repository's own `.claude/`, `CLAUDE.md`, `CLAUDE.local.md` and `.mcp.json`
+  are removed for the run (and restored before the commit), and the default
+  flags ignore project settings and MCP servers and deny shell and web tools —
+  a repository cannot configure hooks or permissions for the agent;
+- the GitHub token is not in the checkout's `.git/config`;
+- a failed **preview** build is never pushed with `direct`; it can at most open a
+  pull request;
+- `direct` pushes fast-forward only, never `--force`.
+
+That narrows prompt injection to "it edits files", which in `pr` mode a human
+then reviews. If you set `claude_args` yourself, keep those flags. Do not use
+`direct` on a repository whose contributors or dependencies you do not trust.
+
 ## Configuration
 
 ```toml
@@ -70,8 +88,10 @@ credentials, on your own machine. Nothing is sent anywhere else.
 enabled = false          # the switch that beats every other setting
 mode = "pr"              # pr | direct | off
 claude_bin = "claude"
-claude_args = ["-p", "--output-format", "json", "--max-turns", "14",
-               "--permission-mode", "acceptEdits"]
+claude_args = ["--disallowedTools", "Bash,WebFetch,WebSearch",
+               "-p", "--output-format", "json", "--max-turns", "14",
+               "--permission-mode", "acceptEdits",
+               "--setting-sources", "user", "--strict-mcp-config"]
 max_per_repo_per_day = 3
 timeout_secs = 900
 report_budget_chars = 2400
@@ -97,7 +117,8 @@ repository owner reviewing a pull request is told plainly where it came from.
 ## What it will not do
 
 - It will not run when `enabled = false`, whatever a site is set to.
-- It will not push to a branch unless a site explicitly chooses `direct`.
+- It will not push to a branch unless a site explicitly chooses `direct`, and
+  never for a preview build, and never with `--force`.
 - It will not push straight to the openpages repository, ever. `heal_self`
   opens pull requests only.
 - It will not retry a failure it has already attempted.

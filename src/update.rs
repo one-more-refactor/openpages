@@ -261,10 +261,9 @@ async fn compile(state: &Shared, target: &str, dest: &Path) -> Result<()> {
     let _ = tokio::fs::remove_dir_all(&src).await;
     tokio::fs::create_dir_all(&src).await?;
 
-    let url = crate::gh::clone_url(
-        &state.cfg.update.repo,
-        state.gh.token().await.ok().as_deref(),
-    );
+    // The release repository is public; no credential is needed, and one in
+    // the URL would sit in `.git/config` of a tree whose tests we then run.
+    let url = crate::gh::clone_url(&state.cfg.update.repo);
     run(
         &src,
         "git",
