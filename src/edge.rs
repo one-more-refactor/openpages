@@ -834,6 +834,34 @@ mod tests {
         assert_eq!(get(d, "/").await, (StatusCode::OK, "home".into()));
     }
 
+    /// From 936f5ed: a symlink out of the deployment is refused, one that
+    /// stays inside it is still served.
+    #[tokio::test]
+    async fn symlinks_out_of_the_deployment_are_not_served() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "host file").unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(site.path().join("index.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(site.path().join("a.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            site.path().join("leak.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink(site.path().join("a.txt"), site.path().join("alias.txt"))
+            .unwrap();
+
+        assert_eq!(get(site.path(), "/index.html").await.0, StatusCode::OK);
+        assert_eq!(
+            get(site.path(), "/alias.txt").await,
+            (StatusCode::OK, "inside".into())
+        );
+        for p in ["/leak.txt", "/dir/secret.txt"] {
+            assert_eq!(get(site.path(), p).await.0, StatusCode::NOT_FOUND, "{p}");
+        }
+    }
+
     #[test]
     fn a_target_signature_binds_the_key_the_spec_and_the_time() {
         let sig = sign_target("k", "container:3000", 1_000);
@@ -878,6 +906,8 @@ mod tests {
                 .uri("/")
                 .header(TARGET_HEADER, "container:18999")
                 .header(SIGNATURE_HEADER, "1.forged")
+                // 936f5ed's static node-key header: also never forwarded.
+                .header("x-openpages-node-key", "forged")
                 .body(Body::empty())
                 .unwrap()
         };

@@ -95,10 +95,14 @@ pub async fn run(cfg: Config) -> Result<()> {
 
 impl Agent {
     /// What the panel stores for this node, and so the key it signs edge
-    /// targets with: the SHA-256 of the secret half of the token.
-    fn edge_key(&self) -> String {
-        let secret = self.token.split_once('.').map(|(_, s)| s).unwrap_or("");
-        crate::util::sha256_hex(secret)
+    /// targets with: the SHA-256 of the secret half of the token. A token
+    /// without a secret has no key, and then nothing opens the edge: the hash
+    /// of an empty secret is a key anyone can compute.
+    fn edge_key(&self) -> Option<String> {
+        match self.token.split_once('.') {
+            Some((_, secret)) if !secret.is_empty() => Some(crate::util::sha256_hex(secret)),
+            _ => None,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -274,18 +278,18 @@ async fn serve(State(agent): State<Agent>, req: Request) -> Response {
 
     // Only the panel knows this node's token hash, so only the panel can say
     // what to serve. Anything else is a stranger asking for a loopback port.
-    let signed = edge::header_str(
-        req.headers(),
-        axum::http::HeaderName::from_static(edge::SIGNATURE_HEADER),
-    )
-    .is_some_and(|sig| {
-        edge::verify_target(
-            &agent.edge_key(),
-            &spec,
-            &sig,
-            chrono::Utc::now().timestamp(),
-        )
-    });
+    let signed = match (
+        agent.edge_key(),
+        edge::header_str(
+            req.headers(),
+            axum::http::HeaderName::from_static(edge::SIGNATURE_HEADER),
+        ),
+    ) {
+        (Some(key), Some(sig)) => {
+            edge::verify_target(&key, &spec, &sig, chrono::Utc::now().timestamp())
+        }
+        _ => false,
+    };
     if !signed {
         return (
             StatusCode::FORBIDDEN,
@@ -383,5 +387,41 @@ mod tests {
         )
         .await;
         assert_eq!(ok.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// From 936f5ed, on the signed-target design: the key is the hash of this
+    /// node's own secret, and a token without a secret opens nothing.
+    #[tokio::test]
+    async fn only_the_hash_of_our_own_secret_opens_the_edge() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = agent(d.path()); // token "n_test.s3cret"
+        assert_eq!(a.edge_key(), Some(crate::util::sha256_hex("s3cret")));
+
+        let now = chrono::Utc::now().timestamp();
+        let other = edge::sign_target(&crate::util::sha256_hex("other"), "static:blog/1", now);
+        let r = serve(
+            State(a.clone()),
+            req(&[
+                (edge::TARGET_HEADER, "static:blog/1"),
+                (edge::SIGNATURE_HEADER, &other),
+            ]),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        for broken in ["no-dot", "n_ab12cd."] {
+            a.token = broken.into();
+            assert_eq!(a.edge_key(), None, "{broken}");
+            let empty = edge::sign_target(&crate::util::sha256_hex(""), "static:blog/1", now);
+            let r = serve(
+                State(a.clone()),
+                req(&[
+                    (edge::TARGET_HEADER, "static:blog/1"),
+                    (edge::SIGNATURE_HEADER, &empty),
+                ]),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{broken}");
+        }
     }
 }

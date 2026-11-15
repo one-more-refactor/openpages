@@ -780,6 +780,26 @@ mod tests {
         assert!(within(src.path(), &src.path().join(".")).is_ok());
     }
 
+    /// From 936f5ed, on `within`: a symlinked output dir, and a symlinked root
+    /// dir with a real-looking output under it, are both refused.
+    #[test]
+    fn a_symlinked_or_escaping_output_directory_is_refused() {
+        let outside = dir_with(&[("index.html", "<h1>host</h1>")]);
+        let work = dir_with(&[("real/index.html", "<h1>ok</h1>")]);
+        std::os::unix::fs::symlink(outside.path(), work.path().join("dist")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), work.path().join("root")).unwrap();
+
+        assert!(within(work.path(), &work.path().join("real")).is_ok());
+        let err = within(work.path(), &work.path().join("dist"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        let err = within(work.path(), &work.path().join("root/."))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside"), "{err}");
+    }
+
     #[test]
     fn only_a_hex_commit_sha_reaches_git() {
         assert!(is_commit_sha("0123abc"));
